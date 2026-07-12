@@ -1,0 +1,11 @@
+# Ignore OS files
+.DS_Store
+
+# Ignore temporary files
+*.tmp
+*.enc
+*.swp
+
+# Ignore test repositories and settings
+/test_repo/
+/test/tmp/
