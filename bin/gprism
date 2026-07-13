@@ -1,686 +1,279 @@
 #!/usr/bin/env ruby
-# frozen_string_literal: true
-
-require 'optparse'
 require 'yaml'
 require 'openssl'
-require 'base64'
-require 'fileutils'
-require 'tempfile'
 require 'digest'
+require 'fileutils'
+require 'shellwords'
+require 'io/console'
 
-$PROG_NAME = 'gprism'
-$PROG_VER = '1.0.0'
+require 'base64'
 
-# Text coloring helpers (Linux standard coloring)
-def green(s);  "\e[32m#{s}\e[0m"; end
-def red(s);    "\e[31m#{s}\e[0m"; end
-def yellow(s); "\e[33m#{s}\e[0m"; end
-def blue(s);   "\e[34m#{s}\e[0m"; end
-def cyan(s);   "\e[36m#{s}\e[0m"; end
-def bold(s);   "\e[1m#{s}\e[0m"; end
+# Terminal colors
+CYAN  = "\e[36m"
+GREEN = "\e[32m"
+RED   = "\e[31m"
+BLUE  = "\e[34m"
+RESET = "\e[0m"
 
-# Load YAML configuration from standard paths
+def info(msg) puts "#{CYAN}INFO:#{RESET} #{msg}" end
+def success(msg) puts "#{GREEN}SUCCESS:#{RESET} #{msg}" end
+def error(msg) puts "#{RED}ERROR:#{RESET} #{msg}"; exit 1 end
+def warn(msg) puts "#{RED}WARN:#{RESET} #{msg}" end
+
+# Config loading
 def load_config
-  config_paths = [
-    File.expand_path('~/.config/gprism/config.yaml'),
-    File.expand_path('~/.config/git-privatize/config.yaml'),
-    File.expand_path('~/.gprism.yaml'),
-    File.expand_path('~/.git-privatize.yaml')
-  ]
   config = {}
-  config_paths.each do |path|
-    if File.exist?(path)
-      begin
-        loaded = YAML.load_file(path)
-        if loaded.is_a?(Hash)
-          config = loaded
-          break
-        end
-      rescue => e
-        warn yellow("Warning: Failed to load config at #{path}: #{e.message}")
+  yaml_path = File.expand_path("~/.config/gprism/config.yaml")
+  yaml_path_alt = File.expand_path("~/.gprism.yaml")
+  env_path = ".env"
+
+  if File.exist?(yaml_path)
+    config = YAML.load_file(yaml_path) || {}
+  elsif File.exist?(yaml_path_alt)
+    config = YAML.load_file(yaml_path_alt) || {}
+  end
+
+  # Fallback to local .env
+  if File.exist?(env_path)
+    File.readlines(env_path).each do |line|
+      next if line.strip.empty? || line.start_with?('#')
+      k, v = line.strip.split('=', 2)
+      if k.start_with?("GPRISM_")
+        config[k.sub("GPRISM_", "").downcase] = v
       end
     end
   end
-  config['environment'] ||= 'dev'
+
+  # Load from ENV directly if still missing
+  config['project_id'] ||= ENV['GPRISM_PROJECT_ID']
+  config['identity']   ||= ENV['GPRISM_IDENTITY']
+  config['environment'] ||= ENV['GPRISM_ENVIRONMENT']
+
   config
 end
 
-# Check and configure active gcloud CLI settings
-def check_gcloud_config!(config)
-  unless system("which gcloud >/dev/null 2>&1")
-    raise "gcloud CLI is not installed or not in PATH."
-  end
-
-  # Check active project and set if configured
-  if config['gcp_project_id']
-    active_project = `gcloud config get-value project 2>/dev/null`.strip
-    if active_project != config['gcp_project_id']
-      puts "Setting active gcloud project to #{config['gcp_project_id']}..."
-      unless system("gcloud config set project '#{config['gcp_project_id']}' >/dev/null 2>&1")
-        raise "Failed to set gcloud project to #{config['gcp_project_id']}"
-      end
-    end
-  else
-    # Fallback: check what is currently set
-    project = `gcloud config get-value project 2>/dev/null`.strip
-    if project.empty?
-      raise "No GCP Project ID configured. Set gcp_project_id in your config file or run 'gcloud config set project'."
-    end
-    config['gcp_project_id'] = project
-  end
-
-  # Check active account and set if configured
-  if config['gcp_account']
-    active_account = `gcloud config get-value account 2>/dev/null`.strip
-    if active_account != config['gcp_account']
-      puts "Setting active gcloud account to #{config['gcp_account']}..."
-      unless system("gcloud config set account '#{config['gcp_account']}' >/dev/null 2>&1")
-        raise "Failed to set gcloud account to #{config['gcp_account']}"
-      end
+def get_passphrase(env)
+  env_var = "GIT_PRIVATIZE_KEY_#{env.upcase}"
+  
+  if ENV[env_var] || ENV['GIT_PRIVATIZE_KEY']
+    if env.start_with?('test')
+      warn "Cleartext password used via ENV for testing environment '#{env}'."
+      return ENV[env_var] || ENV['GIT_PRIVATIZE_KEY']
+    else
+      warn "Cleartext password via ENV is ONLY acceptable for 'test*' environments. Ignoring ENV password and falling back to Keychain/Prompt."
     end
   end
+
+  keychain_id = "gprism-#{env}"
+
+  # Try keychain
+  out = `security find-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w 2>/dev/null`.strip
+  return out unless out.empty?
+
+  # Prompt
+  print "Enter gprism encryption passphrase for env '#{env}': "
+  pass = STDIN.noecho(&:gets).chomp
+  puts
+  
+  # For non-interactive or testing, we shouldn't block, so default to not saving if no terminal
+  if STDIN.tty?
+    print "Save to macOS Keychain? [Y/n] "
+    ans = STDIN.gets.chomp.downcase
+    if ans == 'y' || ans.empty?
+      `security add-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w #{Shellwords.escape(pass)} -U`
+      success "Saved to Keychain."
+    end
+  end
+  
+  pass
 end
 
-# macOS Keychain Helper Methods
-def get_keychain_password
-  return nil unless RUBY_PLATFORM.include?('darwin')
-  cmd = 'security find-generic-password -s "gprism" -a "gprism" -w 2>/dev/null'
-  pass = `#{cmd}`.strip
-  pass.empty? ? nil : pass
-end
-
-def save_keychain_password(password)
-  return false unless RUBY_PLATFORM.include?('darwin')
-  escaped_pass = password.gsub('"', '\\"')
-  cmd = "security add-generic-password -s \"gprism\" -a \"gprism\" -w \"#{escaped_pass}\" -U 2>/dev/null"
-  system(cmd)
-end
-
-# Symmetric Encryption (AES-256-CBC with PBKDF2 derivation compatible with openssl CLI)
-def encrypt(data, password)
-  cipher = OpenSSL::Cipher.new('aes-256-cbc')
+def encrypt(data, pass)
+  cipher = OpenSSL::Cipher.new('AES-256-CBC')
   cipher.encrypt
   salt = OpenSSL::Random.random_bytes(8)
-  iter = 20000
-  digest = OpenSSL::Digest.new('sha256')
-  
-  # Derive key and IV together, split them
-  key_iv = OpenSSL::PKCS5.pbkdf2_hmac(password, salt, iter, cipher.key_len + cipher.iv_len, digest)
+  key_iv = OpenSSL::PKCS5.pbkdf2_hmac(pass, salt, 2000, cipher.key_len + cipher.iv_len, 'sha256')
   cipher.key = key_iv[0, cipher.key_len]
   cipher.iv = key_iv[cipher.key_len, cipher.iv_len]
-  
   encrypted = cipher.update(data) + cipher.final
-  # Return Base64 encoded payload matching: Salted__ + salt + encrypted
-  Base64.strict_encode64("Salted__" + salt + encrypted)
+  Base64.strict_encode64("Salted__#{salt}#{encrypted}")
 end
 
-# Symmetric Decryption
-def decrypt(base64_data, password)
-  binary_data = Base64.strict_decode64(base64_data)
-  unless binary_data.start_with?("Salted__")
-    raise "Invalid encrypted data format (missing Salted__ prefix)"
-  end
-  
-  salt = binary_data[8, 8]
-  ciphertext = binary_data[16..-1]
-  
-  cipher = OpenSSL::Cipher.new('aes-256-cbc')
+def decrypt(data, pass)
+  decoded = Base64.strict_decode64(data.strip)
+  return decoded unless decoded.start_with?("Salted__")
+  salt = decoded[8, 8]
+  encrypted = decoded[16..-1]
+  cipher = OpenSSL::Cipher.new('AES-256-CBC')
   cipher.decrypt
-  iter = 20000
-  digest = OpenSSL::Digest.new('sha256')
-  
-  key_iv = OpenSSL::PKCS5.pbkdf2_hmac(password, salt, iter, cipher.key_len + cipher.iv_len, digest)
+  key_iv = OpenSSL::PKCS5.pbkdf2_hmac(pass, salt, 2000, cipher.key_len + cipher.iv_len, 'sha256')
   cipher.key = key_iv[0, cipher.key_len]
   cipher.iv = key_iv[cipher.key_len, cipher.iv_len]
-  
-  cipher.update(ciphertext) + cipher.final
+  cipher.update(encrypted) + cipher.final
 rescue => e
-  raise "Decryption failed. Please check your cryptographic password. Detail: #{e.message}"
+  error "Decryption failed! Wrong password? Error: #{e.message}"
 end
 
-# Resolve the password from environment, keychain, config, or prompt
-def get_crypto_password(config)
-  if ENV['GIT_PRIVATIZE_KEY'] && !ENV['GIT_PRIVATIZE_KEY'].empty?
-    return ENV['GIT_PRIVATIZE_KEY']
+def generate_secret_name(filepath, env)
+  # Replace non-alphanumeric with dashes
+  slug = filepath.gsub(/[^a-zA-Z0-9]/, '-')
+  slug = slug.gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+  name = "#{env}-#{slug}"
+  if name.length > 255
+    hash = Digest::SHA256.hexdigest(filepath)[0, 16]
+    name = "#{name[0, 230]}-#{hash}"
   end
-
-  # Try Keychain
-  keychain_pass = get_keychain_password
-  return keychain_pass if keychain_pass
-
-  if config['crypto_password'] && !config['crypto_password'].empty?
-    return config['crypto_password']
-  end
-
-  if STDIN.tty?
-    print "Enter cryptographic password for gprism: "
-    begin
-      require 'io/console'
-      pass = STDIN.noecho(&:gets).chomp
-      puts ""
-      if pass.empty?
-        raise "Password cannot be empty."
-      end
-      
-      # Ask to save to keychain
-      if RUBY_PLATFORM.include?('darwin')
-        print "Would you like to save this password to macOS Keychain? [y/N]: "
-        save_choice = STDIN.gets.chomp.strip.downcase
-        if save_choice == 'y' || save_choice == 'yes'
-          if save_keychain_password(pass)
-            puts green("✔ Saved password to macOS Keychain.")
-          else
-            puts yellow("⚠ Failed to save password to macOS Keychain.")
-          end
-        end
-      end
-      
-      return pass
-    rescue LoadError, StandardError
-      pass = STDIN.gets.chomp
-      return pass
-    end
-  else
-    raise "Non-interactive shell and no decryption key found in environment, keychain, or config."
-  end
+  name
 end
 
-# Get Git Repository Information
-def get_git_info
-  unless system("git rev-parse --show-toplevel >/dev/null 2>&1")
-    raise "Not inside a Git repository."
-  end
-  root = `git rev-parse --show-toplevel`.strip
-  url = `git remote get-url origin 2>/dev/null`.strip
-  if url.empty?
-    url = "local-repo-" + File.basename(root)
-  end
-  [root, url]
+def list_files
+  return [] unless File.exist?('.git-privatize.list')
+  File.readlines('.git-privatize.list').map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
 end
 
-# Parse Git Remote URL into host, owner, and repository name
-def parse_git_url(url)
-  if url =~ /git@([^:]+):([^\/]+)\/(.+)\.git$/
-    [$1, $2, $3]
-  elsif url =~ /git@([^\/]+)\/([^\/]+)\/(.+)\.git$/
-    [$1, $2, $3]
-  elsif url =~ /https?:\/\/([^\/]+)\/([^\/]+)\/([^\/\.]+)(\.git)?$/
-    [$1, $2, $3]
-  elsif url =~ /ssh:\/\/.*@([^\/:]+)(:\d+)?\/([^\/]+)\/(.+)\.git$/
-    [$1, $3, $4]
-  elsif url =~ /sso:\/\/([^\/]+)\/([^\/]+)/
-    ['sso', $1, $2]
-  else
-    ['local', 'repo', url.gsub(/[^a-zA-Z0-9_-]/, '-')]
+def gcp_secret_exists?(project, name)
+  system("gcloud secrets describe #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} >/dev/null 2>&1")
+end
+
+def create_gcp_secret(project, name)
+  system("gcloud secrets create #{Shellwords.escape(name)} --replication-policy=automatic --project=#{Shellwords.escape(project)} >/dev/null 2>&1")
+end
+
+def add_gcp_secret_version(project, name, content)
+  IO.popen("gcloud secrets versions add #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --data-file=- >/dev/null 2>&1", "w") do |io|
+    io.write(content)
   end
+  $?.success?
 end
 
-# Normalization methods for Secret Manager constraints
-def normalize_slug(str)
-  str.downcase.gsub(/[^a-zA-Z0-9_-]/, '-')
+def fetch_gcp_secret_version(project, name)
+  `gcloud secrets versions access latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} 2>/dev/null`
 end
 
-def file_slug(path)
-  slug = path.gsub(/[^a-zA-Z0-9_-]/, '-')
-  slug = slug.gsub(/-+/, '-')
-  slug = slug.gsub(/^-+|-+$/, '')
-  slug
-end
-
-# Create the Secret Manager name with length checking and hashing fallback
-def determine_secret_name(rel_path, remote_url, config)
-  host, owner, repo = parse_git_url(remote_url)
-  host_slug = normalize_slug(host)
-  owner_slug = normalize_slug(owner)
-  repo_slug = normalize_slug(repo)
-  f_slug = file_slug(rel_path)
-  env_slug = normalize_slug(config['environment'])
-  
-  raw_name = "gp--#{env_slug}--#{host_slug}--#{owner_slug}--#{repo_slug}--#{f_slug}"
-  
-  if raw_name.length > 255
-    # Truncate and append a hash of the original name to guarantee uniqueness under 255 chars
-    hash_suffix = Digest::SHA256.hexdigest(raw_name)[0, 12]
-    allowed_len = 255 - hash_suffix.length - 2 # space for separator '--'
-    truncated_prefix = raw_name[0, allowed_len]
-    truncated_prefix = truncated_prefix.gsub(/-+$/, '') # Remove trailing hyphens
-    "#{truncated_prefix}--#{hash_suffix}"
-  else
-    raw_name
-  end
-end
-
-# Add a file to gitignore if not already present
-def add_to_gitignore(repo_root, rel_path)
-  gitignore_path = File.join(repo_root, '.gitignore')
-  ignored = false
-  if File.exist?(gitignore_path)
-    lines = File.readlines(gitignore_path).map(&:strip)
-    ignored = lines.include?(rel_path) || lines.include?("/" + rel_path)
-  end
-  
-  unless ignored
-    File.open(gitignore_path, 'a') do |f|
-      f.puts "" unless File.size(gitignore_path) == 0 || File.read(gitignore_path).end_with?("\n")
-      f.puts "# gprism secrets"
-      f.puts rel_path
-    end
-    puts green("✔ Added #{cyan(rel_path)} to .gitignore")
-  end
-end
-
-# Write the markdown readme breadcrumb file
-def write_breadcrumb(file_path, rel_path, secret_name, project_id, config, remote_url)
-  breadcrumb_path = file_path + ".readme"
-  host, owner, repo = parse_git_url(remote_url)
-  
-  content = <<~MARKDOWN
-    # Privatized File: #{rel_path}
-
-    This file has been privatized and stored securely in Google Cloud Secret Manager.
-    It is encrypted using AES-256-CBC.
-
-    ## How to Restore
-
-    You can restore this file by running:
-    ```bash
-    gprism pull #{rel_path}
-    ```
-
-    If you do not have `gprism` installed, you can retrieve and decrypt the secret manually:
-    1. Retrieve the ciphertext:
-       ```bash
-       gcloud secrets versions access latest --secret=#{secret_name} --project=#{project_id} > #{File.basename(rel_path)}.enc
-       ```
-    2. Decrypt the file (requires the cryptographic password):
-       ```bash
-       openssl enc -d -aes-256-cbc -pbkdf2 -iter 20000 -md sha256 -base64 -in #{File.basename(rel_path)}.enc -out #{File.basename(rel_path)}
-       ```
-
-    ## Metadata
-    - **Secret Name**: #{secret_name}
-    - **GCP Project**: #{project_id}
-    - **Namespace/Environment**: #{config['environment']}
-    - **Original Path**: #{rel_path}
-    - **Host/Owner/Repo**: #{host}/#{owner}/#{repo}
-  MARKDOWN
-  
-  File.write(breadcrumb_path, content)
-  puts green("✔ Created breadcrumb file: #{cyan(rel_path + '.readme')}")
-end
-
-# Parse breadcrumb metadata
-def parse_breadcrumb(readme_path)
-  content = File.read(readme_path)
-  metadata = {}
-  if content =~ /- \*\*Secret Name\*\*:\s*(\S+)/
-    metadata[:secret_name] = $1
-  end
-  if content =~ /- \*\*GCP Project\*\*:\s*(\S+)/
-    metadata[:project_id] = $1
-  end
-  if content =~ /- \*\*Original Path\*\*:\s*(\S+)/
-    metadata[:original_path] = $1
-  end
-  metadata
-end
-
-# Load .git-privatize.list files
-def load_list_files(repo_root)
-  list_path = File.join(repo_root, '.git-privatize.list')
-  return [] unless File.exist?(list_path)
-  
-  File.readlines(list_path)
-    .map(&:strip)
-    .reject { |line| line.empty? || line.start_with?('#') }
-end
-
-# Command: Push secret file to Secret Manager
-def cmd_push(files, options, config)
-  repo_root, remote_url = get_git_info
-  
-  # Determine files
-  files_to_push = []
-  if options[:all]
-    list_files = load_list_files(repo_root)
-    if list_files.empty?
-      puts yellow("No files configured in .git-privatize.list.")
-      return
-    end
-    list_files.each do |f|
-      abs_f = File.expand_path(File.join(repo_root, f))
-      if File.exist?(abs_f)
-        files_to_push << abs_f
-      else
-        puts yellow("Warning: Configured secret file does not exist locally: #{f}")
-      end
-    end
-  else
-    if files.empty?
-      puts red("No files specified to push. Use 'gprism push <files>' or 'gprism push --all'.")
-      exit 1
-    end
-    files.each do |f|
-      abs_f = File.expand_path(f)
-      if File.exist?(abs_f)
-        files_to_push << abs_f
-      else
-        puts red("File does not exist: #{f}")
+def update_gitignore(files)
+  gitignore = ".gitignore"
+  lines = File.exist?(gitignore) ? File.readlines(gitignore).map(&:strip) : []
+  File.open(gitignore, "a") do |f|
+    files.each do |file|
+      unless lines.include?(file)
+        f.puts file
+        success "Added #{file} to .gitignore"
+        lines << file # Update lines array to prevent duplicates in same run
       end
     end
   end
-  
-  if files_to_push.empty?
-    puts red("No valid files to push.")
-    exit 1
-  end
-  
-  # Get encryption password
-  password = get_crypto_password(config)
-  
-  files_to_push.each do |file|
-    abs_path = File.expand_path(file)
-    if File.directory?(abs_path)
-      puts red("Directories are not supported directly. Please specify files: #{file}")
-      next
-    end
-    unless abs_path.start_with?(repo_root)
-      puts red("File must be inside the Git repository: #{file}")
-      next
-    end
-    
-    rel_path = abs_path[(repo_root.length + 1)..-1]
-    secret_name = determine_secret_name(rel_path, remote_url, config)
-    
-    puts "Encrypting and uploading #{cyan(rel_path)}..."
-    file_content = File.read(abs_path)
-    encrypted_payload = encrypt(file_content, password)
-    
-    # Check if Secret exists in Secret Manager, create if missing
-    project_id = config['gcp_project_id']
-    describe_cmd = "gcloud secrets describe '#{secret_name}' --project='#{project_id}' >/dev/null 2>&1"
-    
-    unless system(describe_cmd)
-      puts "Creating secret #{bold(secret_name)} in Secret Manager..."
-      create_cmd = "gcloud secrets create '#{secret_name}' --replication-policy='automatic' --project='#{project_id}'"
-      unless system(create_cmd)
-        puts red("Error: Failed to create secret #{secret_name}")
+end
+
+CONFIG = load_config
+if CONFIG['project_id'].nil?
+  error "Project ID missing. Set GPRISM_PROJECT_ID in .env or config.yaml"
+end
+ENV_NS = CONFIG['environment'] || 'dev'
+
+case ARGV[0]
+when "push"
+  if ARGV[1] == "--all" || ARGV[1] == "-a"
+    pass = get_passphrase(ENV_NS)
+    files = list_files
+    files.each do |file|
+      unless File.exist?(file)
+        warn "File #{file} not found, skipping."
         next
       end
-    end
-    
-    # Add new secret version using tempfile to avoid leaking CLI args
-    success = false
-    Tempfile.create('gprism-cipher') do |temp|
-      temp.write(encrypted_payload)
-      temp.close
-      add_version_cmd = "gcloud secrets versions add '#{secret_name}' --data-file='#{temp.path}' --project='#{project_id}' >/dev/null 2>&1"
-      success = system(add_version_cmd)
-    end
-    
-    if success
-      puts green("✔ Successfully uploaded to Secret Manager: #{secret_name}")
-      add_to_gitignore(repo_root, rel_path)
-      write_breadcrumb(abs_path, rel_path, secret_name, project_id, config, remote_url)
-      puts yellow("Note: Your secret is safe. Remember not to commit #{cyan(rel_path)} (it is git-ignored).")
-    else
-      puts red("Error: Failed to upload secret version.")
-    end
-  end
-end
-
-# Command: Pull secret files from Secret Manager
-def cmd_pull(files, options, config)
-  repo_root, _ = get_git_info
-  
-  # Determine files to pull
-  readme_files = []
-  
-  if options[:all]
-    list_files = load_list_files(repo_root)
-    list_files.each do |f|
-      readme_path = File.expand_path(File.join(repo_root, "#{f}.readme"))
-      if File.exist?(readme_path)
-        readme_files << readme_path
+      
+      name = generate_secret_name(file, ENV_NS)
+      content = File.read(file)
+      enc_content = encrypt(content, pass)
+      
+      create_gcp_secret(CONFIG['project_id'], name) unless gcp_secret_exists?(CONFIG['project_id'], name)
+      if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
+        success "Pushed #{file} to Secret Manager as #{name}"
+        File.write("#{file}.readme", "This file is managed by gprism. Secret name: #{name}\nRun `gprism pull --all` to restore.")
+        update_gitignore([file])
+        File.delete(file)
+        info "Replaced #{file} with #{CYAN}#{file}.readme#{RESET}"
       else
-        puts yellow("Warning: Breadcrumb not found for configured secret: #{f}.readme")
+        error "Failed to push #{file}"
       end
-    end
-  elsif files.empty?
-    # Default behavior: auto-pull based on breadcrumbs
-    readme_files = Dir.glob(File.join(repo_root, "**/{*,.*}.readme")).select do |f|
-      begin
-        content = File.read(f)
-        content.include?("Privatized File:") && content.include?("gp--")
-      rescue
-        false
-      end
-    end
-    if readme_files.empty?
-      puts yellow("No gprism breadcrumbs found in repository.")
-      return
     end
   else
-    files.each do |f|
-      abs_f = File.expand_path(f)
-      if abs_f.end_with?(".readme")
-        readme_files << abs_f if File.exist?(abs_f)
-      else
-        readme_path = abs_f + ".readme"
-        if File.exist?(readme_path)
-          readme_files << readme_path
-        else
-          puts red("No breadcrumb found for: #{f}")
-        end
+    puts "Usage: gprism push --all"
+  end
+
+when "pull"
+  if ARGV[1] == "--all" || ARGV[1] == "-a"
+    pass = get_passphrase(ENV_NS)
+    files = list_files
+    files.each do |file|
+      name = generate_secret_name(file, ENV_NS)
+      
+      if !gcp_secret_exists?(CONFIG['project_id'], name)
+        warn "Secret #{name} not found in GCP, skipping #{file}."
+        next
+      end
+      
+      enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
+      if enc_content.nil? || enc_content.empty?
+        warn "Failed to fetch content for #{name}"
+        next
+      end
+      
+      dec_content = decrypt(enc_content, pass)
+      FileUtils.mkdir_p(File.dirname(file))
+      File.write(file, dec_content)
+      success "Restored #{file} from GCP"
+      if File.exist?("#{file}.readme")
+        File.delete("#{file}.readme")
       end
     end
-  end
-  
-  if readme_files.empty?
-    puts red("No valid breadcrumbs found to restore.")
-    exit 1
-  end
-  
-  # Get decryption password
-  password = get_crypto_password(config)
-  
-  readme_files.each do |readme_path|
-    metadata = parse_breadcrumb(readme_path)
-    secret_name = metadata[:secret_name]
-    project_id = metadata[:project_id]
-    rel_path = metadata[:original_path]
-    
-    unless secret_name && project_id && rel_path
-      puts red("Could not parse metadata from breadcrumb: #{readme_path}")
-      next
-    end
-    
-    local_target_path = File.join(repo_root, rel_path)
-    
-    # Check if target already exists
-    if File.exist?(local_target_path)
-      puts yellow("Skipping #{cyan(rel_path)}: File already exists locally.")
-      next
-    end
-    
-    puts "Pulling secret #{bold(secret_name)}..."
-    
-    # Retrieve ciphertext from Secret Manager
-    ciphertext = nil
-    Tempfile.create('gprism-cipher-access') do |temp|
-      access_cmd = "gcloud secrets versions access latest --secret='#{secret_name}' --project='#{project_id}' > '#{temp.path}' 2>/dev/null"
-      if system(access_cmd)
-        ciphertext = File.read(temp.path)
-      end
-    end
-    
-    if ciphertext.nil? || ciphertext.empty?
-      puts red("Error: Failed to retrieve secret from Secret Manager.")
-      next
-    end
-    
-    # Decrypt and write back
-    begin
-      decrypted_data = decrypt(ciphertext, password)
-      FileUtils.mkdir_p(File.dirname(local_target_path))
-      File.write(local_target_path, decrypted_data)
-      puts green("✔ Restored: #{cyan(rel_path)}")
-    rescue => e
-      puts red("Error decrypting #{cyan(rel_path)}: #{e.message}")
-    end
-  end
-end
-
-# Command: Status checking
-def cmd_status(config)
-  repo_root, remote_url = get_git_info
-  
-  # Find all .readme breadcrumbs
-  readme_files = Dir.glob(File.join(repo_root, "**/{*,.*}.readme")).select do |f|
-    begin
-      content = File.read(f)
-      content.include?("Privatized File:") && content.include?("gp--")
-    rescue
-      false
-    end
-  end
-  
-  puts bold("Gprism Status:")
-  puts "Repository Root: #{blue(repo_root)}"
-  puts "GCP Project:     #{config['gcp_project_id']}"
-  puts "Env Namespace:   #{config['environment']}"
-  puts "--------------------------------------------------------"
-  
-  list_files = load_list_files(repo_root)
-  unless list_files.empty?
-    puts "Tracked in .git-privatize.list:"
-    list_files.each { |f| puts " - #{cyan(f)}" }
-    puts "--------------------------------------------------------"
-  end
-  
-  if readme_files.empty?
-    puts "No privatized secrets tracked in this repository."
-    return
-  end
-  
-  project_id = config['gcp_project_id']
-  
-  readme_files.each do |readme_path|
-    metadata = parse_breadcrumb(readme_path)
-    secret_name = metadata[:secret_name]
-    rel_path = metadata[:original_path]
-    
-    next unless secret_name && rel_path
-    
-    local_path = File.join(repo_root, rel_path)
-    
-    # Visual Coloring: Blue for folder paths, Cyan for filenames
-    colored_rel_path = if rel_path.include?("/")
-                         parts = rel_path.split("/")
-                         file_part = parts.pop
-                         blue(parts.join("/") + "/") + cyan(file_part)
-                       else
-                         cyan(rel_path)
-                       end
-    
-    local_status = File.exist?(local_path) ? green("[FOUND]") : red("[MISSING]")
-    
-    # Check GCP Secret Manager status
-    gcp_check = "gcloud secrets describe '#{secret_name}' --project='#{project_id}' >/dev/null 2>&1"
-    gcp_status = system(gcp_check) ? green("[FOUND]") : red("[MISSING]")
-    
-    # Check gitignore status
-    gitignore_path = File.join(repo_root, '.gitignore')
-    git_ignored = false
-    if File.exist?(gitignore_path)
-      lines = File.readlines(gitignore_path).map(&:strip)
-      git_ignored = lines.include?(rel_path) || lines.include?("/" + rel_path)
-    end
-    ignore_status = git_ignored ? green("[IGNORED]") : red("[NOT IGNORED]")
-    
-    status_label = "OK"
-    if !File.exist?(local_path)
-      status_label = yellow("RESTORE REQUIRED")
-    elsif !system(gcp_check)
-      status_label = yellow("NOT UPLOADED")
-    elsif !git_ignored
-      status_label = red("WARNING: NOT GIT-IGNORED")
-    end
-    
-    puts "🔐 #{bold(colored_rel_path)}"
-    puts "   Local File:  #{local_status}"
-    puts "   GCP Secret:  #{gcp_status} (#{secret_name})"
-    puts "   Git Ignored: #{ignore_status}"
-    puts "   Status:      #{status_label}"
-    puts ""
-  end
-end
-
-# Main entrypoint
-def main
-  config = load_config
-  
-  options = {}
-  parser = OptionParser.new do |opts|
-    opts.banner = "Usage: #{$PROG_NAME} [options] [action] [files...]"
-    opts.separator ""
-    opts.separator "Actions:"
-    opts.separator "    push / add <files>     Encrypts and uploads files to GCP Secret Manager"
-    opts.separator "    pull / restore [files] Downloads and decrypts files from GCP Secret Manager"
-    opts.separator "    status                 Shows local vs cloud secret status"
-    opts.separator ""
-    opts.separator "Options:"
-    
-    opts.on("-a", "--all", "Process all files listed in .git-privatize.list") do
-      options[:all] = true
-    end
-    opts.on("-e", "--env ENVIRONMENT", "Override environment/namespace (default: #{config['environment']})") do |env|
-      config['environment'] = env
-    end
-    opts.on("-p", "--project PROJECT_ID", "Override GCP Project ID") do |proj|
-      config['gcp_project_id'] = proj
-    end
-    opts.on("-h", "--help", "Prints this help message") do
-      puts opts
-      exit
-    end
-    opts.on("-v", "--version", "Prints version information") do
-      puts "#{$PROG_NAME} v#{$PROG_VER}"
-      exit
-    end
-  end
-  
-  parser.parse!
-  
-  action = ARGV.shift
-  
-  if action.nil?
-    puts parser
-    exit 1
-  end
-  
-  begin
-    check_gcloud_config!(config)
-  rescue => e
-    puts red("GCP Error: #{e.message}")
-    exit 1
-  end
-  
-  case action
-  when 'push', 'add'
-    cmd_push(ARGV, options, config)
-  when 'pull', 'restore', 'sync'
-    cmd_pull(ARGV, options, config)
-  when 'status', 'st', 'list'
-    cmd_status(config)
   else
-    puts red("Unknown action: #{action}")
-    puts parser
+    puts "Usage: gprism pull --all"
+  end
+
+when "add"
+  file = ARGV[1]
+  if file.nil? || file.empty?
+    puts "Usage: gprism add <filepath>"
     exit 1
   end
-end
+  
+  unless File.exist?(file)
+    error "File #{file} does not exist locally."
+  end
+  
+  list_file = '.git-privatize.list'
+  lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
+  unless lines.include?(file)
+    File.open(list_file, "a") { |f| f.puts file }
+    success "Added #{file} to #{list_file}"
+  else
+    info "#{file} is already in #{list_file}"
+  end
+  
+  update_gitignore([file])
+  info "Run `gprism push --all` to encrypt and upload."
 
-if __FILE__ == $0
-  main
+when "status"
+  files = list_files
+  if files.empty?
+    info "No files listed in .git-privatize.list"
+    exit 0
+  end
+  puts "Gprism Status (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
+  files.each do |file|
+    name = generate_secret_name(file, ENV_NS)
+    in_gcp = gcp_secret_exists?(CONFIG['project_id'], name)
+    local_exists = File.exist?(file)
+    readme_exists = File.exist?("#{file}.readme")
+    
+    status = []
+    status << "#{GREEN}In GCP#{RESET}" if in_gcp
+    status << "#{RED}Missing in GCP#{RESET}" unless in_gcp
+    status << "#{GREEN}Local File#{RESET}" if local_exists
+    status << "#{CYAN}Local Readme#{RESET}" if readme_exists
+    
+    puts "- #{file} -> #{name} [#{status.join(', ')}]"
+  end
+else
+  puts "Usage: gprism [add|push|pull|status] <args>"
 end
