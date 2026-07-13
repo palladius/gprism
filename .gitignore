@@ -9,3 +9,4 @@
 # Ignore test repositories and settings
 /test_repo/
 /test/tmp/
+.env

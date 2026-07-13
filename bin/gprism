@@ -152,8 +152,15 @@ end
 
 def update_gitignore(files)
   gitignore = ".gitignore"
-  lines = File.exist?(gitignore) ? File.readlines(gitignore).map(&:strip) : []
+  content = File.exist?(gitignore) ? File.read(gitignore) : ""
+  lines = content.split("\n").map(&:strip)
+  
+  needs_newline = !content.empty? && !content.end_with?("\n")
+  
   File.open(gitignore, "a") do |f|
+    f.puts if needs_newline
+    needs_newline = false # only needed once
+    
     files.each do |file|
       unless lines.include?(file)
         f.puts file
@@ -164,7 +171,21 @@ def update_gitignore(files)
   end
 end
 
+def warn_if_not_git_ignored(file)
+  return unless File.exist?(file)
+  
+  # Check if we're in a git repo first
+  return unless system("git rev-parse --is-inside-work-tree >/dev/null 2>&1")
+  
+  unless system("git check-ignore -q #{Shellwords.escape(file)} >/dev/null 2>&1")
+    warn "Hey its not git ignored: #{file}"
+    info "Run this to fix it: echo #{file} >> .gitignore"
+  end
+end
+
 CONFIG = load_config
+warn_if_not_git_ignored('.env')
+
 if CONFIG['project_id'].nil?
   error "Project ID missing. Set GPRISM_PROJECT_ID in .env or config.yaml"
 end
@@ -261,6 +282,7 @@ when "status"
   end
   puts "Gprism Status (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
   files.each do |file|
+    warn_if_not_git_ignored(file)
     name = generate_secret_name(file, ENV_NS)
     in_gcp = gcp_secret_exists?(CONFIG['project_id'], name)
     local_exists = File.exist?(file)
