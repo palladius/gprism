@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-07-15
+### Changed
+- **Forbid Folder Additions:** The `gprism add` command now explicitly checks if the provided path is a directory and returns an error message instead of failing silently or down the line.
+
 ## [0.2.1] - 2026-07-15
 ### Changed
 - Improved `gprism list` output format to properly display repository names and append a list of matching file names at the end.
