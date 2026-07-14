@@ -369,6 +369,10 @@ when "add"
     error "File #{file} does not exist locally."
   end
   
+  if File.directory?(file)
+    error "Folders are not supported. Please add individual files."
+  end
+  
   File.chmod(0600, file)
   success "Made #{file} writable (0600)"
   

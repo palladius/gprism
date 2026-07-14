@@ -28,7 +28,7 @@ An evolution of `git-privatize` that stores your secret files (like `.env`) secu
 
 ## Usage
 
-* `gprism add <filepath>`: Adds a file to `.git-privatize.list` and `.gitignore`.
+* `gprism add <filepath>`: Adds a file to `.git-privatize.list` and `.gitignore`. **Note: Adding folders is NOT supported.**
 * `gprism push --all`: Encrypts and pushes all files matching the `.git-privatize.list` to GCP Secret Manager. Replaces the files locally with `.readme` breadcrumbs containing the secret names.
 * `gprism pull --all`: Fetches, decrypts, and restores the files from GCP Secret Manager to their original locations.
 * `gprism status`: Shows the current status of your privatized files.
