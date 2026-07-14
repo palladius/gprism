@@ -65,9 +65,18 @@ def get_passphrase(env)
   end
 
   keychain_id = "gprism-#{env}"
+  is_mac = RUBY_PLATFORM.include?('darwin')
+  is_linux = RUBY_PLATFORM.include?('linux')
 
-  # Try keychain
-  out = `security find-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w 2>/dev/null`.strip
+  # Try keychain/keyring
+  out = ""
+  if is_mac
+    out = `security find-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w 2>/dev/null`.strip
+  elsif is_linux
+    if system("command -v secret-tool >/dev/null 2>&1")
+      out = `secret-tool lookup service gprism account "#{keychain_id}" 2>/dev/null`.strip
+    end
+  end
   return out unless out.empty?
 
   # Prompt
@@ -77,11 +86,29 @@ def get_passphrase(env)
   
   # For non-interactive or testing, we shouldn't block, so default to not saving if no terminal
   if STDIN.tty?
-    print "Save to macOS Keychain? [Y/n] "
+    keyring_name = is_mac ? "macOS Keychain" : (is_linux ? "Linux Keyring" : "system keyring")
+    print "Save to #{keyring_name}? [Y/n] "
     ans = STDIN.gets.chomp.downcase
     if ans == 'y' || ans.empty?
-      `security add-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w #{Shellwords.escape(pass)} -U`
-      success "Saved to Keychain."
+      if is_mac
+        `security add-generic-password -s "#{keychain_id}" -a "#{keychain_id}" -w #{Shellwords.escape(pass)} -U`
+        success "Saved to Keychain."
+      elsif is_linux
+        if system("command -v secret-tool >/dev/null 2>&1")
+          IO.popen("secret-tool store --label=\"#{keychain_id}\" service gprism account \"#{keychain_id}\"", "w") do |io|
+            io.write(pass)
+          end
+          if $?.success?
+            success "Saved to Linux Keyring."
+          else
+            warn "Failed to save to Linux Keyring."
+          end
+        else
+          warn "Cannot save: secret-tool not found (install libsecret-tools)."
+        end
+      else
+        warn "Keyring saving not implemented for this OS."
+      end
     end
   end
   
