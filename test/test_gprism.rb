@@ -31,12 +31,24 @@ class TestGprism < Minitest::Test
     
     # Create git-privatize.list
     File.write(".git-privatize.list", @secret_file)
+    
+    url = `git config --get remote.origin.url 2>/dev/null`.strip
+    if url.empty?
+      repo_slug = "unknown-repo"
+    else
+      if url.include?(":") && !url.start_with?("http")
+        url = url.split(":", 2).last
+      end
+      url = url.sub(%r{^https?://[^/]+/}, "")
+      url = url.sub(/\.git$/, "")
+      repo_slug = url.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+    end
+    @secret_name = "test--#{repo_slug}--my-secret-file-txt"
   end
 
   def teardown
     # Clean up GCP secrets
-    name = "test-my-secret-file-txt"
-    system("gcloud secrets delete #{name} --project=palladius-genai --quiet >/dev/null 2>&1")
+    system("gcloud secrets delete #{@secret_name} --project=palladius-genai --quiet >/dev/null 2>&1")
     
     # Clean up files
     Dir.chdir(@workdir)
@@ -49,7 +61,7 @@ class TestGprism < Minitest::Test
 
     # 1. PUSH
     out = `#{@bin} push --all`.gsub(/\e\[\d+m/, '')
-    assert_includes out, "SUCCESS: Pushed #{@secret_file} to Secret Manager as test-my-secret-file-txt"
+    assert_includes out, "SUCCESS: Pushed #{@secret_file} to Secret Manager as #{@secret_name}"
     
     # Verify local file is replaced by readme
     refute File.exist?(@secret_file), "Secret file should be deleted after push"
@@ -60,8 +72,7 @@ class TestGprism < Minitest::Test
     assert_includes File.read(".gitignore"), @secret_file
     
     # Verify GCP secret is encrypted
-    name = "test-my-secret-file-txt"
-    enc_content = `gcloud secrets versions access latest --secret=#{name} --project=palladius-genai 2>/dev/null`.strip
+    enc_content = `gcloud secrets versions access latest --secret=#{@secret_name} --project=palladius-genai 2>/dev/null`.strip
     require 'base64'
     decoded_enc_content = Base64.strict_decode64(enc_content)
     assert decoded_enc_content.start_with?("Salted__"), "GCP secret should be encrypted"
