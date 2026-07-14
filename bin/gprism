@@ -375,7 +375,6 @@ when "add"
   
   File.chmod(0600, file)
   success "Made #{file} writable (0600)"
-  
   list_file = '.git-privatize.list'
   lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
   unless lines.include?(file)
