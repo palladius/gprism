@@ -1,3 +1,5 @@
+# encoding: utf-8
+Encoding.default_external = Encoding::UTF_8
 require 'minitest/autorun'
 require 'fileutils'
 require 'digest'
@@ -35,7 +37,9 @@ class TestGprism < Minitest::Test
 
   def teardown
     # Clean up GCP secrets
-    name = "test-my-secret-file-txt"
+    repo_slug = `git config --get remote.origin.url 2>/dev/null`.strip.split(":").last.sub(%r{^https?://[^/]+/}, "").sub(/\.git$/, "").gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+    repo_slug = "unknown-repo" if repo_slug.empty?
+    name = "test--#{repo_slug}--my-secret-file-txt"
     system("gcloud secrets delete #{name} --project=palladius-genai --quiet >/dev/null 2>&1")
     
     # Clean up files
@@ -49,7 +53,7 @@ class TestGprism < Minitest::Test
 
     # 1. PUSH
     out = `#{@bin} push --all`.gsub(/\e\[\d+m/, '')
-    assert_includes out, "SUCCESS: Pushed #{@secret_file} to Secret Manager as test-my-secret-file-txt"
+    assert_includes out, "SUCCESS: Pushed #{@secret_file} to Secret Manager as test--"
     
     # Verify local file is replaced by readme
     refute File.exist?(@secret_file), "Secret file should be deleted after push"
@@ -60,7 +64,9 @@ class TestGprism < Minitest::Test
     assert_includes File.read(".gitignore"), @secret_file
     
     # Verify GCP secret is encrypted
-    name = "test-my-secret-file-txt"
+    repo_slug = `git config --get remote.origin.url 2>/dev/null`.strip.split(":").last.sub(%r{^https?://[^/]+/}, "").sub(/\.git$/, "").gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+    repo_slug = "unknown-repo" if repo_slug.empty?
+    name = "test--#{repo_slug}--my-secret-file-txt"
     enc_content = `gcloud secrets versions access latest --secret=#{name} --project=palladius-genai 2>/dev/null`.strip
     require 'base64'
     decoded_enc_content = Base64.strict_decode64(enc_content)
@@ -74,7 +80,7 @@ class TestGprism < Minitest::Test
     
     # 3. PULL
     pull_out = `#{@bin} pull --all`.gsub(/\e\[\d+m/, '')
-    assert_includes pull_out, "SUCCESS: Restored #{@secret_file} from GCP"
+    assert_includes pull_out, "SUCCESS: Restored #{@secret_file} from GCP (read-only)"
     
     # Verify local file is restored and decrypted
     assert File.exist?(@secret_file), "Secret file should be restored"

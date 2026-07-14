@@ -164,6 +164,51 @@ def fetch_gcp_secret_version(project, name)
   `gcloud secrets versions access latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} 2>/dev/null`
 end
 
+def fetch_gcp_secret_timestamp(project, name)
+  `gcloud secrets versions describe latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --format="value(createTime)" 2>/dev/null`.strip
+end
+
+def compare_and_prompt(action, file, name, local_content, remote_content, project)
+  local_md5 = Digest::MD5.hexdigest(local_content)
+  remote_md5 = Digest::MD5.hexdigest(remote_content)
+  
+  if local_md5 == remote_md5
+    info "#{file} is identical to remote secret #{name}. Skipping #{action}."
+    return false
+  end
+  
+  require 'time'
+  local_time = File.mtime(file)
+  remote_time_str = fetch_gcp_secret_timestamp(project, name)
+  remote_time = Time.parse(remote_time_str) rescue Time.at(0)
+  
+  today = Time.now.strftime("%Y-%m-%d")
+  fmt_time = ->(t) { t.strftime("%Y-%m-%d") == today ? t.strftime("%H:%M:%S") : t.strftime("%Y-%m-%d") }
+  
+  puts "Conflict for #{file}:"
+  puts "  Local:  MD5 #{CYAN}#{local_md5[0, 8]}#{RESET}, modified #{fmt_time.call(local_time)}"
+  puts "  Remote: MD5 #{BLUE}#{remote_md5[0, 8]}#{RESET}, modified #{fmt_time.call(remote_time)}"
+  
+  recommended = local_time > remote_time ? "push" : "pull"
+  emoji = recommended == "push" ? "⬆️ " : "⬇️ "
+  ours_theirs = recommended == "push" ? "(ours)" : "(theirs)"
+  
+  if recommended == action
+    puts "  Recommended direction: #{GREEN}#{emoji} #{recommended.capitalize} #{ours_theirs}#{RESET}"
+  else
+    puts "  Recommended direction: #{RED}#{emoji} #{recommended.capitalize} #{ours_theirs}#{RESET} (Warning: You are trying to #{action}!)"
+  end
+  
+  if STDIN.tty?
+    print "Are you sure you want to #{action} and overwrite? [y/N] "
+    ans = STDIN.gets.chomp.downcase
+    return ans == 'y'
+  else
+    warn "Non-interactive mode, skipping #{action} due to conflict."
+    return false
+  end
+end
+
 def update_gitignore(files)
   gitignore = ".gitignore"
   content = File.exist?(gitignore) ? File.read(gitignore) : ""
@@ -220,7 +265,16 @@ when "push"
       content = File.read(file)
       enc_content = encrypt(content, pass)
       
-      create_gcp_secret(CONFIG['project_id'], name) unless gcp_secret_exists?(CONFIG['project_id'], name)
+      if gcp_secret_exists?(CONFIG['project_id'], name)
+        remote_enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
+        if remote_enc_content && !remote_enc_content.empty?
+          remote_content = decrypt(remote_enc_content, pass)
+          next unless compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
+        end
+      else
+        create_gcp_secret(CONFIG['project_id'], name)
+      end
+      
       if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
         success "Pushed #{file} to Secret Manager as #{name}"
         File.write("#{file}.readme", "This file is managed by gprism. Secret name: #{name}\nRun `gprism pull --all` to restore.")
@@ -254,9 +308,17 @@ when "pull"
       end
       
       dec_content = decrypt(enc_content, pass)
+      
+      if File.exist?(file)
+        local_content = File.read(file)
+        next unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
+      end
+      
       FileUtils.mkdir_p(File.dirname(file))
+      File.delete(file) if File.exist?(file)
       File.write(file, dec_content)
-      success "Restored #{file} from GCP"
+      File.chmod(0400, file)
+      success "Restored #{file} from GCP (read-only)"
       if File.exist?("#{file}.readme")
         File.delete("#{file}.readme")
       end
@@ -275,6 +337,9 @@ when "add"
   unless File.exist?(file)
     error "File #{file} does not exist locally."
   end
+  
+  File.chmod(0600, file)
+  success "Made #{file} writable (0600)"
   
   list_file = '.git-privatize.list'
   lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
