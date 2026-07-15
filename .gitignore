@@ -10,3 +10,4 @@
 /test_repo/
 /test/tmp/
 .env
+test/.env-per-finta
