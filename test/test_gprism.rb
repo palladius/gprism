@@ -1,3 +1,5 @@
+# encoding: utf-8
+Encoding.default_external = Encoding::UTF_8
 require 'minitest/autorun'
 require 'fileutils'
 require 'digest'
@@ -85,7 +87,7 @@ class TestGprism < Minitest::Test
     
     # 3. PULL
     pull_out = `#{@bin} pull --all`.gsub(/\e\[\d+m/, '')
-    assert_includes pull_out, "SUCCESS: Restored #{@secret_file} from GCP"
+    assert_includes pull_out, "SUCCESS: Restored #{@secret_file} from GCP (read-only)"
     
     # Verify local file is restored and decrypted
     assert File.exist?(@secret_file), "Secret file should be restored"
