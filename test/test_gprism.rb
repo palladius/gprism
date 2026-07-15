@@ -94,4 +94,16 @@ class TestGprism < Minitest::Test
     assert_equal @secret_content, File.read(@secret_file), "Decrypted content should match original"
     refute File.exist?("#{@secret_file}.readme"), "Readme should be deleted after pull"
   end
+  def test_add_folder
+    # Create a dummy folder
+    folder_name = "dummy_folder"
+    FileUtils.mkdir_p(folder_name)
+
+    # Try to add the folder
+    out = `#{@bin} add #{folder_name} 2>&1`.gsub(/\e\[\d+m/, '')
+    
+    # Assert it returns an error
+    assert_includes out, "ERROR: Folders are not supported. Please add individual files."
+    refute_equal 0, $?.exitstatus, "Should exit with non-zero status"
+  end
 end
