@@ -141,7 +141,7 @@ rescue => e
   error "Decryption failed! Wrong password? Error: #{e.message}"
 end
 
-def get_repo_slug
+def get_repo_name
   url = `git config --get remote.origin.url 2>/dev/null`.strip
   return "unknown-repo" if url.empty?
   
@@ -151,7 +151,11 @@ def get_repo_slug
   
   url = url.sub(%r{^https?://[^/]+/}, "")
   url = url.sub(/\.git$/, "")
-  url.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+  url
+end
+
+def get_repo_slug
+  get_repo_name.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
 end
 
 def generate_secret_name(filepath, env)
@@ -344,6 +348,7 @@ when "list", "ls"
   
   show_all = false
   repo_filter = nil
+  raw_repo = nil
   
   ARGV[1..-1].each_with_index do |arg, i|
     if arg == "--all" || arg == "-a"
@@ -356,7 +361,12 @@ when "list", "ls"
   end
   
   # Default to current repo if no explicit filters are passed
-  repo_filter = get_repo_slug if !show_all && repo_filter.nil?
+  if !show_all && repo_filter.nil?
+    repo_filter = get_repo_slug 
+    repo_display_name = get_repo_name
+  else
+    repo_display_name = raw_repo || repo_filter
+  end
   
   puts "#{CYAN}Fetching secrets from GCP Project: #{CONFIG['project_id']}...#{RESET}"
   secrets_json = `gcloud secrets list --project=#{Shellwords.escape(CONFIG['project_id'])} --format=json 2>/dev/null`
@@ -372,6 +382,9 @@ when "list", "ls"
   end
   
   count = 0
+  matched_secrets = []
+  local_files = list_files
+  
   secrets.each do |s|
     secret_name = s["name"].split("/").last
     
@@ -396,13 +409,41 @@ when "list", "ls"
     size_str = size > 1024 ? "#{size / 1024}KB" : "#{size}B"
     
     puts "🔑 #{BLUE}#{secret_name}#{RESET} (v#{version_id}) - 📦 #{CYAN}#{size_str}#{RESET}"
+    
+    # Try to extract friendly name
+    friendly_name = nil
+    if repo_filter
+      prefix = "#{ENV_NS}--#{repo_filter}--"
+      if secret_name.start_with?(prefix)
+        local_match = local_files.find { |f| generate_secret_name(f, ENV_NS) == secret_name }
+        if local_match
+          friendly_name = local_match
+        else
+          file_slug = secret_name[prefix.length..-1]
+          file_slug = ".#{file_slug[1..-1]}" if file_slug.start_with?("-")
+          friendly_name = file_slug
+        end
+      else
+        friendly_name = secret_name
+      end
+    else
+      friendly_name = secret_name
+    end
+    matched_secrets << friendly_name
+    
     count += 1
   end
   
   msg = "\nFound #{count} secrets"
   msg += " for env '#{ENV_NS}'" unless show_all
-  msg += " and repo '#{repo_filter}'" if repo_filter
-  msg += "."
+  msg += " and repo '#{repo_display_name}'" if repo_display_name
+  
+  if count > 0
+    msg += ":\n" + matched_secrets.map { |f| "- #{f}" }.join("\n")
+  else
+    msg += "."
+  end
+  
   puts msg
 
 else
