@@ -404,8 +404,16 @@ when "status", "st"
     status << "#{GREEN}Local File#{RESET}" if local_exists
     status << "#{RED}Missing Local File (run `gprism pull -a`)#{RESET}" unless local_exists
     status << "#{CYAN}Local Readme#{RESET}" if readme_exists
+    colorized_file = file
+    if File.symlink?(file)
+      colorized_file = "#{CYAN}#{file}#{RESET}"
+    elsif File.directory?(file)
+      colorized_file = "#{BLUE}#{file}#{RESET}"
+    elsif File.exist?(file) && File.executable?(file)
+      colorized_file = "#{GREEN}#{file}#{RESET}"
+    end
     
-    puts "- #{file} -> #{name} [#{status.join(', ')}]"
+    puts "💾 #{colorized_file} -> #{name} [#{status.join(', ')}]"
   end
 
 when "list", "ls"
