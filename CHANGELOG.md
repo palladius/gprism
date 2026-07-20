@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-20
+### Added
+- Added `gprism init` command to bootstrap `.env.template`, `.git-privatize.list`, and create the GCS bucket.
+- Added GCS bucket offloading for payloads larger than 60KB. They are securely uploaded to GCS and Secret Manager holds a `GPRISM_GCS_URI=` pointer instead.
+- Improved `list` and `status` commands to differentiate between secrets stored natively in Secret Manager and those offloaded to GCS.
+
 ## [0.2.3] - 2026-07-15
 ### Added
 - Added automated test to ensure folder additions correctly fail with an error.

@@ -48,6 +48,7 @@ def load_config
   config['project_id'] ||= ENV['GPRISM_PROJECT_ID']
   config['identity']   ||= ENV['GPRISM_IDENTITY']
   config['environment'] ||= ENV['GPRISM_ENVIRONMENT']
+  config['gcs_bucket'] ||= ENV['GPRISM_GCS_BUCKET']
 
   config
 end
@@ -282,6 +283,32 @@ end
 ENV_NS = CONFIG['environment'] || 'dev'
 
 case ARGV[0]
+when "init"
+  unless File.exist?(".env.template")
+    File.write(".env.template", "GPRISM_PROJECT_ID=your-gcp-project-id\nGPRISM_IDENTITY=your-email@example.com\nGPRISM_ENVIRONMENT=dev\n")
+    success "Created .env.template"
+  end
+  
+  unless File.exist?(".git-privatize.list")
+    FileUtils.touch(".git-privatize.list")
+    success "Created .git-privatize.list"
+  end
+  
+  bucket_name = CONFIG['gcs_bucket'] || "gs://#{CONFIG['project_id']}-gprism"
+  unless bucket_name.start_with?("gs://")
+    bucket_name = "gs://#{bucket_name}"
+  end
+  
+  info "Ensuring GCS bucket #{bucket_name} exists..."
+  system("gcloud storage buckets create #{Shellwords.escape(bucket_name)} >/dev/null 2>&1")
+  
+  info "Enabling GCS object versioning..."
+  if system("gcloud storage buckets update #{Shellwords.escape(bucket_name)} --versioning >/dev/null 2>&1")
+    success "Initialized GCS bucket #{bucket_name} with versioning enabled."
+  else
+    warn "Failed to update GCS bucket. You may need to create it manually or fix your gcloud auth."
+  end
+
 when "push"
   if ARGV[1] == "--all" || ARGV[1] == "-a"
     pass = get_passphrase(ENV_NS)
@@ -299,11 +326,34 @@ when "push"
       if gcp_secret_exists?(CONFIG['project_id'], name)
         remote_enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
         if remote_enc_content && !remote_enc_content.empty?
+          if remote_enc_content.start_with?("GPRISM_GCS_URI=")
+            gcs_uri = remote_enc_content.sub("GPRISM_GCS_URI=", "").strip
+            remote_enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+          end
           remote_content = decrypt(remote_enc_content, pass)
           next unless compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
         end
       else
         create_gcp_secret(CONFIG['project_id'], name)
+      end
+      
+      # Handle large payloads via GCS offloading
+      if enc_content.bytesize > 60_000
+        bucket = CONFIG['gcs_bucket'] || "#{CONFIG['project_id']}-gprism"
+        bucket = bucket.sub(/^gs:\/\//, '')
+        
+        filepath_slug = file.gsub(/[^a-zA-Z0-9\.\-\/]/, '_')
+        gcs_uri = "gs://#{bucket}/#{ENV_NS}/#{get_repo_slug}/#{filepath_slug}.enc"
+        
+        info "Payload large (>60KB). Offloading to GCS: #{gcs_uri}"
+        IO.popen("gcloud storage cp - #{Shellwords.escape(gcs_uri)} >/dev/null 2>&1", "w") do |io|
+          io.write(enc_content)
+        end
+        unless $?.success?
+          error "Failed to upload to GCS bucket #{bucket}."
+        end
+        # The content to push to Secret Manager becomes the pointer
+        enc_content = "GPRISM_GCS_URI=#{gcs_uri}"
       end
       
       if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
@@ -336,6 +386,15 @@ when "pull"
       if enc_content.nil? || enc_content.empty?
         warn "Failed to fetch content for #{name}"
         next
+      end
+      
+      if enc_content.start_with?("GPRISM_GCS_URI=")
+        gcs_uri = enc_content.sub("GPRISM_GCS_URI=", "").strip
+        info "Large payload detected. Downloading from GCS: #{gcs_uri}"
+        enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+        if !$?.success? || enc_content.nil? || enc_content.empty?
+          error "Failed to download payload from GCS: #{gcs_uri}"
+        end
       end
       
       dec_content = decrypt(enc_content, pass)
@@ -394,19 +453,43 @@ when "status", "st"
     exit 0
   end
   puts "Gprism Status (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
+  
+  # Carlessian alignment padding
+  max_file_len = files.map(&:length).max || 0
+  names = files.map { |f| generate_secret_name(f, ENV_NS) }
+  max_name_len = names.map(&:length).max || 0
+  
   files.each do |file|
     warn_if_not_git_ignored(file)
     name = generate_secret_name(file, ENV_NS)
     in_gcp = gcp_secret_exists?(CONFIG['project_id'], name)
+    
+    remote_type = nil
+    if in_gcp
+      payload = fetch_gcp_secret_version(CONFIG['project_id'], name)
+      if payload && payload.start_with?("GPRISM_GCS_URI=")
+        remote_type = "🪣 GS"
+      else
+        remote_type = "🔑 SM"
+      end
+    end
+    
     local_exists = File.exist?(file)
     readme_exists = File.exist?("#{file}.readme")
     
     status = []
-    status << "#{GREEN}In GCP#{RESET}" if in_gcp
-    status << "#{RED}Missing in GCP#{RESET}" unless in_gcp
+    if remote_type
+      status << "#{GREEN}#{remote_type}#{RESET}"
+    else
+      status << "#{RED}Missing Remote#{RESET}"
+    end
     status << "#{GREEN}Local File#{RESET}" if local_exists
-    status << "#{RED}Missing Local File (run `gprism pull -a`)#{RESET}" unless local_exists
-    status << "#{CYAN}Local Readme#{RESET}" if readme_exists
+    status << "#{RED}Missing Local#{RESET}" unless local_exists
+    status << "#{CYAN}Readme#{RESET}" if readme_exists
+    
+    pad_file = " " * [0, max_file_len - file.length].max
+    pad_name = " " * [0, max_name_len - name.length].max
+    
     colorized_file = file
     if File.symlink?(file)
       colorized_file = "#{CYAN}#{file}#{RESET}"
@@ -416,7 +499,7 @@ when "status", "st"
       colorized_file = "#{GREEN}#{file}#{RESET}"
     end
     
-    puts "💾 #{colorized_file} -> #{name} [#{status.join(', ')}]"
+    puts "💾 #{colorized_file}#{pad_file} -> #{name}#{pad_name} [ #{status.join(' | ')} ]"
   end
 
 when "list", "ls"
@@ -484,7 +567,12 @@ when "list", "ls"
     size = payload ? payload.bytesize : 0
     size_str = size > 1024 ? "#{size / 1024}KB" : "#{size}B"
     
-    puts "🔑 #{BLUE}#{secret_name}#{RESET} (v#{version_id}) - 📦 #{CYAN}#{size_str}#{RESET}"
+    if payload && payload.start_with?("GPRISM_GCS_URI=")
+      gcs_uri = payload.sub("GPRISM_GCS_URI=", "").strip
+      puts "🔑 #{BLUE}#{secret_name}#{RESET} (v#{version_id}) - 🪣 #{CYAN}GS#{RESET} (#{gcs_uri.split('/').last})"
+    else
+      puts "🔑 #{BLUE}#{secret_name}#{RESET} (v#{version_id}) - 🔑 #{CYAN}SM#{RESET} (#{size_str})"
+    end
     
     # Try to extract friendly name
     friendly_name = nil
@@ -522,6 +610,28 @@ when "list", "ls"
   
   puts msg
 
+  # --- GCS Server-Side Listing ---
+  bucket_name = CONFIG['gcs_bucket'] || "gs://#{CONFIG['project_id']}-gprism"
+  unless bucket_name.start_with?("gs://")
+    bucket_name = "gs://#{bucket_name}"
+  end
+  
+  puts "\n#{CYAN}Checking GCS storage for repo '#{repo_display_name}' in env '#{ENV_NS}'...#{RESET}"
+  gcs_path = "#{bucket_name}/#{ENV_NS}/#{repo_filter}/"
+  gcs_output = `gcloud storage ls #{Shellwords.escape(gcs_path)} 2>/dev/null`.strip
+  
+  if gcs_output.empty?
+    puts "No offloaded files found in GCS bucket."
+  else
+    puts "🪣 Remote GCS blobs:"
+    gcs_output.split("\n").each do |line|
+      next if line.strip.empty? || !line.start_with?("gs://")
+      # line is like gs://bucket/dev/repo/path_slug.enc
+      file_path = line.sub(gcs_path, "")
+      puts "  - #{GREEN}#{file_path}#{RESET} (in GCS)"
+    end
+  end
+
 else
-  puts "Usage: gprism [add|push|pull|status|st|list|ls] <args>"
+  puts "Usage: gprism [init|add|push|pull|status|st|list|ls] <args>"
 end
