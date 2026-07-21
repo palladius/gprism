@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-07-21
+### Added
+- Added `--force` flag to `gprism push` to enable re-uploading unmodified local files (e.g. to fix remote metadata).
+- Added `--git-ignore` and `--fix` flags to `gprism status` to automatically handle un-ignored and wrongly tracked secrets in `.gitignore`.
+
+### Changed
+- Improved `gprism status` warnings by aggregating them into a single summary block.
+- Updated git-related suggestions in `status` to use root-relative paths (`cd $(git rev-parse --show-toplevel)`), supporting execution from subfolders.
+
 ## [0.3.0] - 2026-07-20
 ### Added
 - Added `gprism init` command to bootstrap `.env.template`, `.git-privatize.list`, and create the GCS bucket.
@@ -41,3 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core CLI commands `add`, `push`, `pull`, `status`.
 - Local `.git-privatize.list` and `.env` config file handling.
 - Readme substitution and `.gitignore` integration to prevent secret leaks.
+
+## 0.3.1
+- Upgraded `gprism st` to show sync state and diffs.
+- Added `--download-binaries` flag.
+
+## 0.3.2
+- BUGFIX: gprism now operates on the git root directory (like `git`) instead of the current folder. All paths are resolved relative to the git root.
+- BUGFIX: Removed useless `.env.template` creation during `gprism init`.

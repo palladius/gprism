@@ -11,3 +11,4 @@
 /test/tmp/
 .env
 test/.env-per-finta
+test/subfolder/new_secret.txt

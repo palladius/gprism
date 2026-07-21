@@ -7,12 +7,41 @@ require 'shellwords'
 require 'io/console'
 
 require 'base64'
+require 'open3'
+
+# If we are in a git repository, always run from the git root
+# and convert any file path arguments to be relative to the git root.
+if system("git rev-parse --is-inside-work-tree >/dev/null 2>&1")
+  git_root = `git rev-parse --show-toplevel 2>/dev/null`.strip
+  unless git_root.empty?
+    current_dir = File.expand_path(Dir.pwd)
+    
+    if current_dir != git_root
+      # Resolve any file arguments passed to the CLI to be relative to git_root
+      ARGV.map! do |arg|
+        if File.exist?(arg) && !arg.start_with?("-")
+          abs_path = File.expand_path(arg)
+          if abs_path.start_with?(git_root)
+            abs_path.sub("#{git_root}/", "")
+          else
+            arg
+          end
+        else
+          arg
+        end
+      end
+      
+      Dir.chdir(git_root)
+    end
+  end
+end
 
 # Terminal colors
 CYAN  = "\e[36m"
 GREEN = "\e[32m"
 RED   = "\e[31m"
 BLUE  = "\e[34m"
+YELLOW = "\e[33m"
 RESET = "\e[0m"
 
 def info(msg) puts "#{CYAN}INFO:#{RESET} #{msg}" end
@@ -177,19 +206,48 @@ def list_files
   File.readlines('.git-privatize.list').map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
 end
 
+def get_local_encryption_key(project, env, repo)
+  name = "#{env}--#{repo}--local-encryption-key"
+  if gcp_secret_exists?(project, name)
+    key = fetch_gcp_secret_version(project, name)
+    return key unless key.nil? || key.empty?
+  end
+  
+  require 'securerandom'
+  new_key = SecureRandom.hex(32)
+  warn "A new encryption key was generated and stored in Secret Manager (#{name})."
+  warn "If this secret is deleted, all your .gprenc files will be permanently lost!"
+  
+  create_gcp_secret(project, name)
+  add_gcp_secret_version(project, name, new_key)
+  new_key
+end
+
+def gcs_initialized?(bucket_name)
+  system("gcloud storage buckets describe #{Shellwords.escape(bucket_name)} >/dev/null 2>&1")
+end
+
 def gcp_secret_exists?(project, name)
   system("gcloud secrets describe #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} >/dev/null 2>&1")
 end
 
-def create_gcp_secret(project, name)
-  system("gcloud secrets create #{Shellwords.escape(name)} --replication-policy=automatic --project=#{Shellwords.escape(project)} >/dev/null 2>&1")
+def create_gcp_secret(project, secret_name)
+  unless gcp_secret_exists?(project, secret_name)
+    cmd = "gcloud secrets create #{Shellwords.escape(secret_name)} --replication-policy=\"automatic\" --project=#{Shellwords.escape(project)}"
+    stdout, stderr, status = Open3.capture3(cmd)
+    unless status.success?
+      raise "Failed to create secret #{secret_name}:\n#{stderr}"
+    end
+  end
 end
 
-def add_gcp_secret_version(project, name, content)
-  IO.popen("gcloud secrets versions add #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --data-file=- >/dev/null 2>&1", "w") do |io|
-    io.write(content)
+def add_gcp_secret_version(project, secret_name, secret_data)
+  cmd = "gcloud secrets versions add #{Shellwords.escape(secret_name)} --data-file=- --project=#{Shellwords.escape(project)}"
+  stdout, stderr, status = Open3.capture3(cmd, stdin_data: secret_data)
+  unless status.success?
+    raise "Failed to add secret version to #{secret_name}:\n#{stderr}"
   end
-  $?.success?
+  true
 end
 
 def fetch_gcp_secret_version(project, name)
@@ -198,6 +256,50 @@ end
 
 def fetch_gcp_secret_timestamp(project, name)
   `gcloud secrets versions describe latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --format="value(createTime)" 2>/dev/null`.strip
+end
+
+def show_diff(local_content, remote_content)
+  is_binary = local_content.include?("\x00") || remote_content.include?("\x00")
+  if is_binary
+    puts "  (Binary file, diff not shown)"
+    return
+  end
+  
+  max_lines = [local_content.lines.size, remote_content.lines.size].max
+  if max_lines <= 5
+    puts "  #{BLUE}===== REMOTE =====#{RESET}"
+    remote_content.each_line { |l| puts "  #{BLUE}#{l.chomp}#{RESET}" }
+    puts "  #{CYAN}===== LOCAL  =====#{RESET}"
+    local_content.each_line { |l| puts "  #{CYAN}#{l.chomp}#{RESET}" }
+    puts "  =================="
+  else
+    require 'tempfile'
+    Tempfile.open('gprism_local') do |loc|
+      loc.write(local_content)
+      loc.flush
+      Tempfile.open('gprism_remote') do |rem|
+        rem.write(remote_content)
+        rem.flush
+        puts "  #{BLUE}===== DIFF (Remote vs Local) =====#{RESET}"
+        require 'open3'
+        stdout, _ = Open3.capture3("diff", "-u", rem.path, loc.path)
+        
+        # Skip the first two lines (diff header)
+        lines = stdout.lines[2..-1] || []
+        lines.each do |line|
+          if line.start_with?('+')
+            puts "  #{GREEN}#{line.chomp}#{RESET}"
+          elsif line.start_with?('-')
+            puts "  #{RED}#{line.chomp}#{RESET}"
+          elsif line.start_with?('@')
+            puts "  #{CYAN}#{line.chomp}#{RESET}"
+          else
+            puts "  #{line.chomp}"
+          end
+        end
+      end
+    end
+  end
 end
 
 def compare_and_prompt(action, file, name, local_content, remote_content, project)
@@ -220,6 +322,8 @@ def compare_and_prompt(action, file, name, local_content, remote_content, projec
   puts "Conflict for #{file}:"
   puts "  Local:  MD5 #{CYAN}#{local_md5[0, 8]}#{RESET}, modified #{fmt_time.call(local_time)}"
   puts "  Remote: MD5 #{BLUE}#{remote_md5[0, 8]}#{RESET}, modified #{fmt_time.call(remote_time)}"
+  
+  show_diff(local_content, remote_content)
   
   recommended = local_time > remote_time ? "push" : "pull"
   emoji = recommended == "push" ? "⬆️ " : "⬇️ "
@@ -262,20 +366,34 @@ def update_gitignore(files)
   end
 end
 
-def warn_if_not_git_ignored(file)
-  return unless File.exist?(file)
+def check_git_ignored_status(file)
+  return :ok unless File.exist?(file)
   
   # Check if we're in a git repo first
-  return unless system("git rev-parse --is-inside-work-tree >/dev/null 2>&1")
+  return :ok unless system("git rev-parse --is-inside-work-tree >/dev/null 2>&1")
   
-  unless system("git check-ignore -q #{Shellwords.escape(file)} >/dev/null 2>&1")
-    warn "Hey its not git ignored: #{file}"
-    info "Run this to fix it: echo #{file} >> .gitignore"
+  # Check if it's already tracked in git
+  if system("git ls-files --error-unmatch #{Shellwords.escape(file)} >/dev/null 2>&1")
+    return :tracked
   end
+  
+  # Check if it's ignored
+  unless system("git check-ignore -q #{Shellwords.escape(file)} >/dev/null 2>&1")
+    return :not_ignored
+  end
+  
+  :ok
 end
 
 CONFIG = load_config
-warn_if_not_git_ignored('.env')
+env_status = check_git_ignored_status('.env')
+if env_status == :tracked
+  puts "#{RED}DANGER: Secret file .env is tracked in Git!#{RESET}"
+  puts "#{YELLOW}Run this to fix it: (cd $(git rev-parse --show-toplevel) && git rm --cached .env)#{RESET}"
+elsif env_status == :not_ignored
+  warn "Hey its not git ignored: .env"
+  info "Run this to fix it: (cd $(git rev-parse --show-toplevel) && echo .env >> .gitignore)"
+end
 
 if CONFIG['project_id'].nil?
   error "Project ID missing. Set GPRISM_PROJECT_ID in .env or config.yaml"
@@ -284,10 +402,6 @@ ENV_NS = CONFIG['environment'] || 'dev'
 
 case ARGV[0]
 when "init"
-  unless File.exist?(".env.template")
-    File.write(".env.template", "GPRISM_PROJECT_ID=your-gcp-project-id\nGPRISM_IDENTITY=your-email@example.com\nGPRISM_ENVIRONMENT=dev\n")
-    success "Created .env.template"
-  end
   
   unless File.exist?(".git-privatize.list")
     FileUtils.touch(".git-privatize.list")
@@ -300,7 +414,7 @@ when "init"
   end
   
   info "Ensuring GCS bucket #{bucket_name} exists..."
-  system("gcloud storage buckets create #{Shellwords.escape(bucket_name)} >/dev/null 2>&1")
+  system("gcloud storage buckets create #{Shellwords.escape(bucket_name)} --project=#{Shellwords.escape(CONFIG['project_id'])} >/dev/null 2>&1")
   
   info "Enabling GCS object versioning..."
   if system("gcloud storage buckets update #{Shellwords.escape(bucket_name)} --versioning >/dev/null 2>&1")
@@ -310,7 +424,7 @@ when "init"
   end
 
 when "push"
-  if ARGV[1] == "--all" || ARGV[1] == "-a"
+  if ARGV.include?("--all") || ARGV.include?("-a")
     pass = get_passphrase(ENV_NS)
     files = list_files
     files.each do |file|
@@ -331,7 +445,8 @@ when "push"
             remote_enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
           end
           remote_content = decrypt(remote_enc_content, pass)
-          next unless compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
+          force_push = ARGV.include?("--force") || ARGV.include?("-f")
+          next unless force_push || compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
         end
       else
         create_gcp_secret(CONFIG['project_id'], name)
@@ -346,7 +461,9 @@ when "push"
         gcs_uri = "gs://#{bucket}/#{ENV_NS}/#{get_repo_slug}/#{filepath_slug}.enc"
         
         info "Payload large (>60KB). Offloading to GCS: #{gcs_uri}"
-        IO.popen("gcloud storage cp - #{Shellwords.escape(gcs_uri)} >/dev/null 2>&1", "w") do |io|
+        orig_md5 = Digest::MD5.hexdigest(content)
+        orig_size = content.bytesize
+        IO.popen("gcloud storage cp - #{Shellwords.escape(gcs_uri)} --custom-metadata=original_md5=#{orig_md5},original_size=#{orig_size} >/dev/null 2>&1", "w") do |io|
           io.write(enc_content)
         end
         unless $?.success?
@@ -358,10 +475,7 @@ when "push"
       
       if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
         success "Pushed #{file} to Secret Manager as #{name}"
-        File.write("#{file}.readme", "This file is managed by gprism. Secret name: #{name}\nRun `gprism pull --all` to restore.")
         update_gitignore([file])
-        File.delete(file)
-        info "Replaced #{file} with #{CYAN}#{file}.readme#{RESET}"
       else
         error "Failed to push #{file}"
       end
@@ -370,8 +484,14 @@ when "push"
     puts "Usage: gprism push --all"
   end
 
+when "pupu"
+  info "Running pull --all..."
+  system("#{$0} pull --all")
+  info "Running push --all..."
+  system("#{$0} push --all")
+
 when "pull"
-  if ARGV[1] == "--all" || ARGV[1] == "-a"
+  if ARGV.include?("--all") || ARGV.include?("-a")
     pass = get_passphrase(ENV_NS)
     files = list_files
     files.each do |file|
@@ -413,6 +533,23 @@ when "pull"
         File.delete("#{file}.readme")
       end
     end
+    
+    local_enc_files = Dir.glob("**/*.gprenc")
+    if local_enc_files.any?
+      info "Found #{local_enc_files.size} local .gprenc files. Decrypting..."
+      key = get_local_encryption_key(CONFIG['project_id'], ENV_NS, get_repo_slug)
+      local_enc_files.each do |enc_file|
+        orig_file = enc_file.sub(/\.gprenc$/, '')
+        enc_content = File.read(enc_file)
+        begin
+          dec = decrypt(enc_content, key)
+          File.write(orig_file, dec)
+          success "Restored #{orig_file} from local .gprenc"
+        rescue => e
+          warn "Failed to decrypt #{enc_file}: #{e.message}"
+        end
+      end
+    end
   else
     puts "Usage: gprism pull --all"
   end
@@ -434,6 +571,21 @@ when "add"
   
   File.chmod(0600, file)
   success "Made #{file} writable (0600)"
+  
+  content_preview = File.read(file, 1024) || ""
+  is_large = File.size(file) > 50_000
+  is_binary = content_preview.include?("\x00")
+  
+  if is_large || is_binary
+    bucket_name = CONFIG['gcs_bucket'] || "gs://#{CONFIG['project_id']}-gprism"
+    bucket_name = "gs://#{bucket_name}" unless bucket_name.start_with?("gs://")
+    if gcs_initialized?(bucket_name)
+      info "Large/binary file detected. This will be automatically routed to GCS during push."
+    else
+      error "This file is too large or binary for Secret Manager. Please run 'gprism init' to enable GCS support."
+    end
+  end
+  
   list_file = '.git-privatize.list'
   lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
   unless lines.include?(file)
@@ -445,6 +597,78 @@ when "add"
   
   update_gitignore([file])
   info "Run `gprism push --all` to encrypt and upload."
+
+when "encrypt"
+  files = []
+  auto_yes = false
+  ARGV[1..-1].each do |arg|
+    if arg == "--yes" || arg == "-y" || arg == "--yes-im-sure"
+      auto_yes = true
+    else
+      if File.directory?(arg)
+        files.concat(Dir.glob("#{arg}/**/*").select { |f| File.file?(f) })
+      else
+        files << arg if File.file?(arg)
+      end
+    end
+  end
+  
+  if files.empty?
+    error "Usage: gprism encrypt <file1> <folder2> ... [--yes]"
+  end
+  
+  if files.size > 10
+    warn "You are trying to encrypt #{files.size} files. This is a lot!"
+  end
+  
+  unless auto_yes
+    warn "Are you sure you want to encrypt locally?"
+    warn "Note: we have a better option to just move it to GCS via 'gprism add'! but if you can't, it's ok to do it like this."
+    print "Proceed? [y/N] "
+    ans = STDIN.gets.chomp.downcase
+    exit 0 unless ans == 'y'
+  end
+  
+  key = get_local_encryption_key(CONFIG['project_id'], ENV_NS, get_repo_slug)
+  
+  files.each do |file|
+    content = File.read(file)
+    enc = encrypt(content, key)
+    enc_file = "#{file}.gprenc"
+    File.write(enc_file, enc)
+    update_gitignore([file])
+    system("git add #{Shellwords.escape(enc_file)}")
+    success "Encrypted #{file} -> #{enc_file} and added to git."
+  end
+
+when "decrypt"
+  files = []
+  ARGV[1..-1].each do |arg|
+    if File.directory?(arg)
+      files.concat(Dir.glob("#{arg}/**/*.gprenc").select { |f| File.file?(f) })
+    else
+      files << arg if File.file?(arg) || File.file?("#{arg}.gprenc")
+    end
+  end
+  
+  if files.empty?
+    error "Usage: gprism decrypt <file1.gprenc> <folder2> ..."
+  end
+  
+  key = get_local_encryption_key(CONFIG['project_id'], ENV_NS, get_repo_slug)
+  
+  files.each do |file|
+    enc_file = file.end_with?(".gprenc") ? file : "#{file}.gprenc"
+    unless File.exist?(enc_file)
+      warn "Encrypted file #{enc_file} not found."
+      next
+    end
+    orig_file = enc_file.sub(/\.gprenc$/, '')
+    enc_content = File.read(enc_file)
+    dec = decrypt(enc_content, key)
+    File.write(orig_file, dec)
+    success "Decrypted #{enc_file} -> #{orig_file}"
+  end
 
 when "status", "st"
   files = list_files
@@ -459,16 +683,35 @@ when "status", "st"
   names = files.map { |f| generate_secret_name(f, ENV_NS) }
   max_name_len = names.map(&:length).max || 0
   
+  verbose = ARGV.include?("--verbose") || ARGV.include?("-v")
+  download_binaries = ARGV.include?("--download-binaries")
+  
+  pass = get_passphrase(ENV_NS) rescue nil
+  diffs_to_show = []
+  tracked_files = []
+  not_ignored_files = []
+  
   files.each do |file|
-    warn_if_not_git_ignored(file)
+    status_sym = check_git_ignored_status(file)
+    tracked_files << file if status_sym == :tracked
+    not_ignored_files << file if status_sym == :not_ignored
+    
     name = generate_secret_name(file, ENV_NS)
-    in_gcp = gcp_secret_exists?(CONFIG['project_id'], name)
+    
+    # 1. Fetch remote payload directly (saves a gcloud call)
+    payload = fetch_gcp_secret_version(CONFIG['project_id'], name)
     
     remote_type = nil
-    if in_gcp
-      payload = fetch_gcp_secret_version(CONFIG['project_id'], name)
-      if payload && payload.start_with?("GPRISM_GCS_URI=")
+    gcs_uri = nil
+    if payload && !payload.empty?
+      if payload.start_with?("GPRISM_GCS_URI=")
         remote_type = "🪣 GS"
+        gcs_uri = payload.sub("GPRISM_GCS_URI=", "").strip
+        if download_binaries
+          payload = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+        else
+          payload = nil # Skip diffing
+        end
       else
         remote_type = "🔑 SM"
       end
@@ -477,15 +720,74 @@ when "status", "st"
     local_exists = File.exist?(file)
     readme_exists = File.exist?("#{file}.readme")
     
+    # 2. Compute Sync state
+    sync_state = nil
+    if remote_type == "🪣 GS" && !download_binaries && local_exists
+      # Check sync state via GCS custom metadata
+      require 'json'
+      meta_json = `gcloud storage objects describe #{Shellwords.escape(gcs_uri)} --format="json(custom_fields)" 2>/dev/null`
+      unless meta_json.strip.empty?
+        begin
+          parsed = JSON.parse(meta_json)
+          meta = (parsed.is_a?(Hash) ? parsed['custom_fields'] : nil) || {}
+          remote_md5 = meta['original_md5']
+          remote_size = meta['original_size']&.to_i
+          
+          local_content = File.read(file)
+          local_md5 = Digest::MD5.hexdigest(local_content)
+          local_size = local_content.bytesize
+          
+          if remote_md5.nil? || remote_md5.empty?
+            sync_state = "#{YELLOW}❓ Unk#{RESET}"
+          elsif local_md5 == remote_md5 && local_size == remote_size
+            sync_state = "#{GREEN}✅ Sync#{RESET}"
+          else
+            sync_state = "#{YELLOW}⚠️ Mod#{RESET}"
+            # Don't show diff for binaries without downloading
+          end
+        rescue JSON::ParserError
+          sync_state = "#{YELLOW}❓ Unk#{RESET}"
+        end
+      else
+        sync_state = "#{YELLOW}❓ Unk#{RESET}"
+      end
+    elsif remote_type && payload && pass
+      remote_content = decrypt(payload, pass)
+      
+      # Always download to .gprism/remote/
+      remote_path = File.join(".gprism/remote", file)
+      FileUtils.mkdir_p(File.dirname(remote_path))
+      File.write(remote_path, remote_content)
+      
+      if local_exists
+        local_content = File.read(file)
+        local_md5 = Digest::MD5.hexdigest(local_content)
+        remote_md5 = Digest::MD5.hexdigest(remote_content)
+        
+        if local_md5 == remote_md5
+          sync_state = "#{GREEN}✅ Sync#{RESET}"
+        else
+          sync_state = "#{YELLOW}⚠️ Mod#{RESET}"
+          diffs_to_show << { file: file, local: local_content, remote: remote_content }
+        end
+      else
+        sync_state = "#{RED}❌ Miss#{RESET}"
+      end
+    elsif local_exists && !remote_type
+      sync_state = "#{RED}❌ Miss#{RESET}"
+    end
+    
     status = []
+    status << sync_state if sync_state
+    
     if remote_type
       status << "#{GREEN}#{remote_type}#{RESET}"
     else
-      status << "#{RED}Missing Remote#{RESET}"
+      status << "#{RED}❌ Remote#{RESET}"
     end
-    status << "#{GREEN}Local File#{RESET}" if local_exists
-    status << "#{RED}Missing Local#{RESET}" unless local_exists
-    status << "#{CYAN}Readme#{RESET}" if readme_exists
+    status << "#{GREEN}💻 Local#{RESET}" if local_exists
+    status << "#{RED}❌ Local#{RESET}" unless local_exists
+    status << "#{CYAN}📝 Readme#{RESET}" if readme_exists
     
     pad_file = " " * [0, max_file_len - file.length].max
     pad_name = " " * [0, max_name_len - name.length].max
@@ -500,6 +802,60 @@ when "status", "st"
     end
     
     puts "💾 #{colorized_file}#{pad_file} -> #{name}#{pad_name} [ #{status.join(' | ')} ]"
+  end
+  
+  local_enc_files = Dir.glob("**/*.gprenc")
+  local_enc_files.each do |enc_file|
+    orig_file = enc_file.sub(/\.gprenc$/, '')
+    
+    pad_file = " " * [0, max_file_len - orig_file.length].max
+    pad_name = " " * [0, max_name_len - enc_file.length].max
+    
+    status = []
+    status << "#{GREEN}🔐 GP#{RESET}"
+    local_exists = File.exist?(orig_file)
+    status << "#{GREEN}💻 Local#{RESET}" if local_exists
+    status << "#{RED}❌ Local#{RESET}" unless local_exists
+    
+    colorized_file = orig_file
+    if File.exist?(orig_file) && File.executable?(orig_file)
+      colorized_file = "#{GREEN}#{orig_file}#{RESET}"
+    end
+    
+    puts "💾 #{colorized_file}#{pad_file} -> #{enc_file}#{pad_name} [ #{status.join(' | ')} ]"
+  end
+  
+  if diffs_to_show.any?
+    puts "\n#{YELLOW}⚠️ Modified Files (Diffs) ⚠️#{RESET}"
+    diffs_to_show.each do |d|
+      puts "\n#{CYAN}--- #{d[:file]} ---#{RESET}"
+      show_diff(d[:local], d[:remote])
+    end
+  end
+  
+  auto_fix = ARGV.include?("--git-ignore") || ARGV.include?("--fix")
+  
+  if tracked_files.any?
+    puts "\n#{RED}DANGER: #{tracked_files.size} secret file(s) are tracked in Git!#{RESET}"
+    cmd = "(cd $(git rev-parse --show-toplevel) && git rm --cached " + tracked_files.map { |f| Shellwords.escape(f) }.join(" ") + ")"
+    if auto_fix
+      puts "#{YELLOW}Auto-fixing tracked files: #{cmd}#{RESET}"
+      system(cmd)
+    else
+      puts "#{YELLOW}Run this to fix it: #{cmd}#{RESET}"
+    end
+  end
+  
+  if not_ignored_files.any?
+    puts "\n#{YELLOW}WARN: #{not_ignored_files.size} file(s) are not git ignored!#{RESET}"
+    files_str = not_ignored_files.map { |f| Shellwords.escape(f) }.join(" ")
+    cmd = "(cd $(git rev-parse --show-toplevel) && printf \"%s\\n\" #{files_str} >> .gitignore)"
+    if auto_fix
+      puts "#{YELLOW}Auto-fixing gitignore: #{cmd}#{RESET}"
+      system(cmd)
+    else
+      puts "#{YELLOW}Run this to fix it: #{cmd}#{RESET}"
+    end
   end
 
 when "list", "ls"
@@ -632,6 +988,55 @@ when "list", "ls"
     end
   end
 
+when "help", "--help", "-h"
+  puts <<~HELP
+    gprism - A Git-Privatize replacement using GCP Secret Manager & Cloud Storage
+
+    Usage:
+      gprism <command> [options]
+
+    Commands:
+      init        Initialize the environment, create .env.template, and set up GCS bucket.
+      add <file>  Add a file to be tracked and encrypted. (0600 permissions will be set).
+      push -a     Encrypt and push all tracked files to GCP. Large files (>50KB) route to GCS.
+      pull -a     Decrypt and pull all tracked files from GCP, overwriting local copies.
+      encrypt     Locally encrypt files/folders to `.gprenc` and auto git add. Supports `--yes`.
+      decrypt     Locally decrypt `.gprenc` files. Usually handled automatically by `pull -a`.
+      status, st  Show the status of tracked files (local vs remote).
+      list, ls    List files tracked in GCP for the current environment and repository.
+                  Use `--all` to show all repositories.
+      help        Show this help message.
+      --ai-help   Show AI-friendly CLI documentation.
+
+    Environment Variables:
+      GPRISM_PROJECT_ID    Your GCP project ID.
+      GPRISM_ENVIRONMENT   The environment namespace (default: dev).
+      GPRISM_GCS_BUCKET    (Optional) Override default GCS bucket name.
+      GIT_PRIVATIZE_KEY_*  Passphrases for your environments.
+
+  HELP
+
+when "--ai-help"
+  puts <<~AI_HELP
+    # gprism AI Help Documentation
+    
+    `gprism` is a CLI tool that encrypts local repository secrets using a symmetric key, then uploads them to GCP Secret Manager (for small text files) or GCS (for large/binary files).
+    
+    ## Commands
+    - `gprism init`: Creates `.env.template`, `.git-privatize.list`, and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
+    - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
+    - `gprism push --all` (or `-a`): Loops over tracked files, encrypts them, and pushes. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager. Removes the plaintext file and creates a `.readme`.
+    - `gprism pull --all` (or `-a`): Loops over tracked files, fetches from Secret Manager (and GCS if pointed), decrypts, and restores the plaintext file. It also finds any local `*.gprenc` files and decrypts them.
+    - `gprism encrypt <files>`: Encrypts files offline, adds original to `.gitignore`, and automatically `git add`s the `.gprenc` file. Uses an auto-generated SM key. Use `--yes` to bypass warnings.
+    - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
+    - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status. Also detects and lists local `*.gprenc` files.
+    - `gprism list` (or `ls`): Queries GCP Secret Manager and GCS directly to list all secrets for the current repository and environment. Can be filtered with `--all`.
+    
+    ## Storage Paradigm
+    - Small Text Files (< 50KB): Encrypted and stored natively in Google Secret Manager.
+    - Large / Binary Files: Encrypted and stored in Google Cloud Storage with object versioning. Secret Manager just stores the GCS pointer (e.g. `GPRISM_GCS_URI=gs://...`).
+  AI_HELP
+
 else
-  puts "Usage: gprism [init|add|push|pull|status|st|list|ls] <args>"
+  puts "Usage: gprism [init|add|push|pull|encrypt|decrypt|status|st|list|ls|help] <args>"
 end
