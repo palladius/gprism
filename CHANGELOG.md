@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-07-27
+### Added
+- Added `gprism show <filepath>` (aliases: `inspect`, `diff`, `describe`) to display a detailed HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, remote timestamps, and unified diffs.
+- Added git-like modification hint in `gprism status` when local files differ from remote.
+
+### Changed
+- Upgraded `gprism status` to report a git-like modified status (`⚠️ M`) when a local secret differs from remote instead of generic `Mod` or `OK`.
+- Calling `gprism` without arguments now defaults to printing `gprism --help`.
+
 ## [0.3.3] - 2026-07-21
 ### Added
 - Added `--force` flag to `gprism push` to enable re-uploading unmodified local files (e.g. to fix remote metadata).

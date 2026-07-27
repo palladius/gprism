@@ -42,7 +42,8 @@ GREEN = "\e[32m"
 RED   = "\e[31m"
 BLUE  = "\e[34m"
 YELLOW = "\e[33m"
-RESET = "\e[0m"
+BOLD   = "\e[1m"
+RESET  = "\e[0m"
 
 def info(msg) puts "#{CYAN}INFO:#{RESET} #{msg}" end
 def success(msg) puts "#{GREEN}SUCCESS:#{RESET} #{msg}" end
@@ -280,7 +281,6 @@ def show_diff(local_content, remote_content)
       Tempfile.open('gprism_remote') do |rem|
         rem.write(remote_content)
         rem.flush
-        puts "  #{BLUE}===== DIFF (Remote vs Local) =====#{RESET}"
         require 'open3'
         stdout, _ = Open3.capture3("diff", "-u", rem.path, loc.path)
         
@@ -742,7 +742,7 @@ when "status", "st"
           elsif local_md5 == remote_md5 && local_size == remote_size
             sync_state = "#{GREEN}✅ Sync#{RESET}"
           else
-            sync_state = "#{YELLOW}⚠️ Mod#{RESET}"
+            sync_state = "#{YELLOW}⚠️ M   #{RESET}"
             # Don't show diff for binaries without downloading
           end
         rescue JSON::ParserError
@@ -767,7 +767,7 @@ when "status", "st"
         if local_md5 == remote_md5
           sync_state = "#{GREEN}✅ Sync#{RESET}"
         else
-          sync_state = "#{YELLOW}⚠️ Mod#{RESET}"
+          sync_state = "#{YELLOW}⚠️ M   #{RESET}"
           diffs_to_show << { file: file, local: local_content, remote: remote_content }
         end
       else
@@ -831,6 +831,10 @@ when "status", "st"
       puts "\n#{CYAN}--- #{d[:file]} ---#{RESET}"
       show_diff(d[:local], d[:remote])
     end
+    puts "\n#{YELLOW}💡 Hint: #{diffs_to_show.size} file(s) have local modifications (M).#{RESET}"
+    puts "#{CYAN}   To inspect details & MD5s: #{RESET}gprism show <filepath> (or gprism diff <filepath>)"
+    puts "#{CYAN}   To push local changes    : #{RESET}gprism push -a"
+    puts "#{CYAN}   To restore from remote   : #{RESET}gprism pull -a"
   end
   
   auto_fix = ARGV.include?("--git-ignore") || ARGV.include?("--fix")
@@ -988,7 +992,121 @@ when "list", "ls"
     end
   end
 
-when "help", "--help", "-h"
+when "show", "inspect", "diff", "describe"
+  file = ARGV[1]
+  if file.nil? || file.empty?
+    puts "Usage: gprism #{ARGV[0]} <filepath>"
+    exit 1
+  end
+  
+  name = generate_secret_name(file, ENV_NS)
+  puts "\n🔍 #{CYAN}Inspecting file:#{RESET} #{GREEN}#{file}#{RESET} (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
+  puts "─" * 75
+  puts "📍 #{BOLD}Secret Name#{RESET} : #{name}"
+
+  local_exists = File.exist?(file)
+  remote_exists = gcp_secret_exists?(CONFIG['project_id'], name)
+
+  remote_type = "❌ None"
+  remote_md5 = nil
+  remote_size = nil
+  remote_time = nil
+  versions_count = 0
+  gcs_uri = nil
+  remote_content = nil
+
+  if remote_exists
+    v_out, _, _ = Open3.capture3("gcloud secrets versions list #{Shellwords.escape(name)} --project=#{Shellwords.escape(CONFIG['project_id'])} --format='value(name)' 2>/dev/null")
+    versions_count = v_out.lines.size
+    remote_time = fetch_gcp_secret_timestamp(CONFIG['project_id'], name)
+    enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
+    
+    if enc_content && !enc_content.empty?
+      if enc_content.start_with?("GPRISM_GCS_URI=")
+        gcs_uri = enc_content.sub("GPRISM_GCS_URI=", "").strip
+        remote_type = "🪣 GS"
+        raw_gcs = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+        if $?.success? && raw_gcs && !raw_gcs.empty?
+          pass = get_passphrase(ENV_NS)
+          remote_content = decrypt(raw_gcs, pass) rescue nil
+        end
+      else
+        remote_type = "🔑 SM"
+        pass = get_passphrase(ENV_NS)
+        remote_content = decrypt(enc_content, pass) rescue nil
+      end
+      if remote_content
+        remote_md5 = Digest::MD5.hexdigest(remote_content)
+        remote_size = remote_content.bytesize
+      end
+    end
+  end
+
+  local_md5 = nil
+  local_size = nil
+  local_time = nil
+  local_content = nil
+  if local_exists
+    local_content = File.read(file)
+    local_md5 = Digest::MD5.hexdigest(local_content)
+    local_size = local_content.bytesize
+    local_time = File.mtime(file).strftime("%Y-%m-%d %H:%M:%S")
+  end
+
+  status_badge = if !local_exists && !remote_exists
+                   "#{RED}❌ Missing Everywhere#{RESET}"
+                 elsif !local_exists
+                   "#{RED}❌ Missing Local#{RESET} (exists remote)"
+                 elsif !remote_exists
+                   "#{RED}❌ Missing Remote#{RESET} (untracked or not pushed)"
+                 elsif local_md5 == remote_md5 && remote_md5
+                   "#{GREEN}✅ Sync#{RESET} (identical)"
+                 else
+                   "#{YELLOW}⚠️ M  #{RESET} (modified vs remote)"
+                 end
+
+  puts "🏛️  #{BOLD}Pillar#{RESET}      : #{remote_type}"
+  puts "📊 #{BOLD}Status#{RESET}      : #{status_badge}"
+  puts "\n💻 #{BOLD}HERE (Local)#{RESET}"
+  if local_exists
+    puts "   ├─ #{BOLD}Path#{RESET}     : #{file}"
+    puts "   ├─ #{BOLD}Size#{RESET}     : #{local_size} bytes"
+    puts "   ├─ #{BOLD}Modified#{RESET} : #{local_time}"
+    puts "   └─ #{BOLD}MD5#{RESET}      : #{CYAN}#{local_md5}#{RESET}"
+  else
+    puts "   └─ #{RED}File not found on local disk.#{RESET}"
+  end
+
+  puts "\n☁️  #{BOLD}THERE (Remote #{remote_type})#{RESET}"
+  if remote_exists
+    puts "   ├─ #{BOLD}Secret ID#{RESET}: #{name}"
+    puts "   ├─ #{BOLD}GCS URI#{RESET}  : #{gcs_uri}" if gcs_uri
+    puts "   ├─ #{BOLD}Versions#{RESET} : #{versions_count} version(s) in Secret Manager"
+    puts "   ├─ #{BOLD}Updated#{RESET}  : #{remote_time || 'Unknown'}"
+    match_str = (local_md5 == remote_md5 && local_md5) ? "#{GREEN}[ ✅ MATCHES LOCAL ]#{RESET}" : "#{RED}[ ⚠️ DOES NOT MATCH LOCAL ]#{RESET}"
+    puts "   └─ #{BOLD}MD5#{RESET}      : #{CYAN}#{remote_md5 || 'N/A'}#{RESET}  #{match_str}"
+  else
+    puts "   └─ #{RED}Secret not found in GCP Secret Manager.#{RESET}"
+  end
+
+  if local_exists && remote_exists && local_content && remote_content && local_md5 != remote_md5
+    puts "\n" + "─" * 75
+    puts "📝 #{BOLD}Difference Details (TEXTUAL File Diff: HERE vs THERE):#{RESET}"
+    puts "   #{RED}[ - ] Red lines   #{RESET}= #{BOLD}THERE#{RESET} (Remote version stored in GCP #{remote_type})"
+    puts "   #{GREEN}[ + ] Green lines #{RESET}= #{BOLD}HERE#{RESET}  (Local modified version on disk: #{file})"
+    show_diff(local_content, remote_content)
+    puts "─" * 75
+    puts "💡 #{BOLD}Hint:#{RESET} Local differs from remote! To overwrite remote with local changes, run: #{GREEN}gprism push -a#{RESET} (or gprism push --force)"
+    puts "         To overwrite local changes with remote version, run: #{GREEN}gprism pull -a#{RESET}"
+  elsif local_exists && !remote_exists
+    puts "\n💡 #{BOLD}Hint:#{RESET} To push this new file to remote, run: #{GREEN}gprism add #{file} && gprism push -a#{RESET}"
+  elsif !local_exists && remote_exists
+    puts "\n💡 #{BOLD}Hint:#{RESET} To pull this file from remote, run: #{GREEN}gprism pull -a#{RESET}"
+  else
+    puts "\n✨ #{GREEN}Everything is in sync!#{RESET}"
+  end
+
+when "help", "--help", "-h", nil
   puts <<~HELP
     gprism - A Git-Privatize replacement using GCP Secret Manager & Cloud Storage
 
@@ -996,17 +1114,18 @@ when "help", "--help", "-h"
       gprism <command> [options]
 
     Commands:
-      init        Initialize the environment, create .env.template, and set up GCS bucket.
-      add <file>  Add a file to be tracked and encrypted. (0600 permissions will be set).
-      push -a     Encrypt and push all tracked files to GCP. Large files (>50KB) route to GCS.
-      pull -a     Decrypt and pull all tracked files from GCP, overwriting local copies.
-      encrypt     Locally encrypt files/folders to `.gprenc` and auto git add. Supports `--yes`.
-      decrypt     Locally decrypt `.gprenc` files. Usually handled automatically by `pull -a`.
-      status, st  Show the status of tracked files (local vs remote).
-      list, ls    List files tracked in GCP for the current environment and repository.
-                  Use `--all` to show all repositories.
-      help        Show this help message.
-      --ai-help   Show AI-friendly CLI documentation.
+      init               Initialize the environment, create .env.template, and set up GCS bucket.
+      add <file>         Add a file to be tracked and encrypted. (0600 permissions will be set).
+      show, inspect <file> Show HERE vs THERE MD5 hashes, timestamps, SM version count, and diffs.
+      push -a            Encrypt and push all tracked files to GCP. Large files (>50KB) route to GCS.
+      pull -a            Decrypt and pull all tracked files from GCP, overwriting local copies.
+      encrypt            Locally encrypt files/folders to `.gprenc` and auto git add. Supports `--yes`.
+      decrypt            Locally decrypt `.gprenc` files. Usually handled automatically by `pull -a`.
+      status, st         Show the status of tracked files (local vs remote).
+      list, ls           List files tracked in GCP for the current environment and repository.
+                         Use `--all` to show all repositories.
+      help               Show this help message.
+      --ai-help          Show AI-friendly CLI documentation.
 
     Environment Variables:
       GPRISM_PROJECT_ID    Your GCP project ID.
@@ -1025,11 +1144,12 @@ when "--ai-help"
     ## Commands
     - `gprism init`: Creates `.env.template`, `.git-privatize.list`, and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
     - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
+    - `gprism show <filepath>` (aliases: `inspect`, `diff`): Displays HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, timestamps, and unified diffs when out of sync.
     - `gprism push --all` (or `-a`): Loops over tracked files, encrypts them, and pushes. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager. Removes the plaintext file and creates a `.readme`.
     - `gprism pull --all` (or `-a`): Loops over tracked files, fetches from Secret Manager (and GCS if pointed), decrypts, and restores the plaintext file. It also finds any local `*.gprenc` files and decrypts them.
     - `gprism encrypt <files>`: Encrypts files offline, adds original to `.gitignore`, and automatically `git add`s the `.gprenc` file. Uses an auto-generated SM key. Use `--yes` to bypass warnings.
     - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
-    - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status. Also detects and lists local `*.gprenc` files.
+    - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.
     - `gprism list` (or `ls`): Queries GCP Secret Manager and GCS directly to list all secrets for the current repository and environment. Can be filtered with `--all`.
     
     ## Storage Paradigm
@@ -1038,5 +1158,5 @@ when "--ai-help"
   AI_HELP
 
 else
-  puts "Usage: gprism [init|add|push|pull|encrypt|decrypt|status|st|list|ls|help] <args>"
+  puts "Usage: gprism [init|add|show|inspect|diff|push|pull|encrypt|decrypt|status|st|list|ls|help] <args>"
 end

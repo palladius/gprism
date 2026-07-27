@@ -148,4 +148,36 @@ class TestGprism < Minitest::Test
     status_out = `#{@bin} status`.gsub(/\e\[\d+m/, '')
     assert_includes status_out, "Sync | 🪣 GS | 💻 Local"
   end
+
+  def test_default_no_args_shows_help
+    out = `#{@bin}`.gsub(/\e\[\d+m/, '')
+    assert_includes out, "Usage:"
+    assert_includes out, "show, inspect <file>"
+  end
+
+  def test_show_and_modified_status
+    # First push the secret created in setup
+    `#{@bin} push --all`
+
+    # Show should display Sync and MD5 matching
+    show_out = `#{@bin} show #{@secret_file}`.gsub(/\e\[\d+m/, '')
+    assert_includes show_out, "HERE (Local)"
+    assert_includes show_out, "THERE (Remote 🔑 SM)"
+    assert_includes show_out, "[ ✅ MATCHES LOCAL ]"
+    assert_includes show_out, "Everything is in sync!"
+
+    # Now modify local file
+    File.write(@secret_file, "MODIFIED_VALUE_#{Time.now.to_i}")
+
+    # Status should report M (modified vs remote)
+    status_out = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    assert_includes status_out, "⚠️ M "
+    assert_includes status_out, "file(s) have local modifications (M)"
+
+    # Show should now report diff and mismatch
+    show_mod = `#{@bin} show #{@secret_file}`.gsub(/\e\[\d+m/, '')
+    assert_includes show_mod, "[ ⚠️ DOES NOT MATCH LOCAL ]"
+    assert_includes show_mod, "Difference Details (TEXTUAL File Diff: HERE vs THERE):"
+    assert_includes show_mod, "MODIFIED_VALUE_"
+  end
 end
