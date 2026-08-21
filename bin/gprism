@@ -424,64 +424,73 @@ when "init"
   end
 
 when "push"
-  if ARGV.include?("--all") || ARGV.include?("-a")
-    pass = get_passphrase(ENV_NS)
+  flags = ARGV[1..-1].select { |arg| arg.start_with?("-") }
+  non_flags = ARGV[1..-1].reject { |arg| arg.start_with?("-") }
+
+  if flags.include?("--all") || flags.include?("-a")
     files = list_files
-    files.each do |file|
-      unless File.exist?(file)
-        warn "File #{file} not found, skipping."
-        next
-      end
-      
-      name = generate_secret_name(file, ENV_NS)
-      content = File.read(file)
-      enc_content = encrypt(content, pass)
-      
-      if gcp_secret_exists?(CONFIG['project_id'], name)
-        remote_enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
-        if remote_enc_content && !remote_enc_content.empty?
-          if remote_enc_content.start_with?("GPRISM_GCS_URI=")
-            gcs_uri = remote_enc_content.sub("GPRISM_GCS_URI=", "").strip
-            remote_enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
-          end
-          remote_content = decrypt(remote_enc_content, pass)
-          force_push = ARGV.include?("--force") || ARGV.include?("-f")
-          next unless force_push || compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
-        end
-      else
-        create_gcp_secret(CONFIG['project_id'], name)
-      end
-      
-      # Handle large payloads via GCS offloading
-      if enc_content.bytesize > 60_000
-        bucket = CONFIG['gcs_bucket'] || "#{CONFIG['project_id']}-gprism"
-        bucket = bucket.sub(/^gs:\/\//, '')
-        
-        filepath_slug = file.gsub(/[^a-zA-Z0-9\.\-\/]/, '_')
-        gcs_uri = "gs://#{bucket}/#{ENV_NS}/#{get_repo_slug}/#{filepath_slug}.enc"
-        
-        info "Payload large (>60KB). Offloading to GCS: #{gcs_uri}"
-        orig_md5 = Digest::MD5.hexdigest(content)
-        orig_size = content.bytesize
-        IO.popen("gcloud storage cp - #{Shellwords.escape(gcs_uri)} --custom-metadata=original_md5=#{orig_md5},original_size=#{orig_size} >/dev/null 2>&1", "w") do |io|
-          io.write(enc_content)
-        end
-        unless $?.success?
-          error "Failed to upload to GCS bucket #{bucket}."
-        end
-        # The content to push to Secret Manager becomes the pointer
-        enc_content = "GPRISM_GCS_URI=#{gcs_uri}"
-      end
-      
-      if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
-        success "Pushed #{file} to Secret Manager as #{name}"
-        update_gitignore([file])
-      else
-        error "Failed to push #{file}"
-      end
-    end
   else
-    puts "Usage: gprism push --all"
+    files = non_flags
+  end
+
+  if files.empty?
+    puts "Usage: gprism push [--all|-a] [file1 file2 ...] [options]"
+    exit 1
+  end
+
+  pass = get_passphrase(ENV_NS)
+  files.each do |file|
+    unless File.exist?(file)
+      warn "File #{file} not found, skipping."
+      next
+    end
+    
+    name = generate_secret_name(file, ENV_NS)
+    content = File.read(file)
+    enc_content = encrypt(content, pass)
+    
+    if gcp_secret_exists?(CONFIG['project_id'], name)
+      remote_enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
+      if remote_enc_content && !remote_enc_content.empty?
+        if remote_enc_content.start_with?("GPRISM_GCS_URI=")
+          gcs_uri = remote_enc_content.sub("GPRISM_GCS_URI=", "").strip
+          remote_enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+        end
+        remote_content = decrypt(remote_enc_content, pass)
+        force_push = flags.include?("--force") || flags.include?("-f")
+        next unless force_push || compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
+      end
+    else
+      create_gcp_secret(CONFIG['project_id'], name)
+    end
+    
+    # Handle large payloads via GCS offloading
+    if enc_content.bytesize > 60_000
+      bucket = CONFIG['gcs_bucket'] || "#{CONFIG['project_id']}-gprism"
+      bucket = bucket.sub(/^gs:\/\//, '')
+      
+      filepath_slug = file.gsub(/[^a-zA-Z0-9\.\-\/]/, '_')
+      gcs_uri = "gs://#{bucket}/#{ENV_NS}/#{get_repo_slug}/#{filepath_slug}.enc"
+      
+      info "Payload large (>60KB). Offloading to GCS: #{gcs_uri}"
+      orig_md5 = Digest::MD5.hexdigest(content)
+      orig_size = content.bytesize
+      IO.popen("gcloud storage cp - #{Shellwords.escape(gcs_uri)} --custom-metadata=original_md5=#{orig_md5},original_size=#{orig_size} >/dev/null 2>&1", "w") do |io|
+        io.write(enc_content)
+      end
+      unless $?.success?
+        error "Failed to upload to GCS bucket #{bucket}."
+      end
+      # The content to push to Secret Manager becomes the pointer
+      enc_content = "GPRISM_GCS_URI=#{gcs_uri}"
+    end
+    
+    if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
+      success "Pushed #{file} to Secret Manager as #{name}"
+      update_gitignore([file])
+    else
+      error "Failed to push #{file}"
+    end
   end
 
 when "pupu"
@@ -491,49 +500,62 @@ when "pupu"
   system("#{$0} push --all")
 
 when "pull"
-  if ARGV.include?("--all") || ARGV.include?("-a")
-    pass = get_passphrase(ENV_NS)
+  flags = ARGV[1..-1].select { |arg| arg.start_with?("-") }
+  non_flags = ARGV[1..-1].reject { |arg| arg.start_with?("-") }
+
+  if flags.include?("--all") || flags.include?("-a")
     files = list_files
-    files.each do |file|
-      name = generate_secret_name(file, ENV_NS)
-      
-      if !gcp_secret_exists?(CONFIG['project_id'], name)
-        warn "Secret #{name} not found in GCP, skipping #{file}."
-        next
-      end
-      
-      enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
-      if enc_content.nil? || enc_content.empty?
-        warn "Failed to fetch content for #{name}"
-        next
-      end
-      
-      if enc_content.start_with?("GPRISM_GCS_URI=")
-        gcs_uri = enc_content.sub("GPRISM_GCS_URI=", "").strip
-        info "Large payload detected. Downloading from GCS: #{gcs_uri}"
-        enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
-        if !$?.success? || enc_content.nil? || enc_content.empty?
-          error "Failed to download payload from GCS: #{gcs_uri}"
-        end
-      end
-      
-      dec_content = decrypt(enc_content, pass)
-      
-      if File.exist?(file)
-        local_content = File.read(file)
-        next unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
-      end
-      
-      FileUtils.mkdir_p(File.dirname(file))
-      File.delete(file) if File.exist?(file)
-      File.write(file, dec_content)
-      File.chmod(0400, file)
-      success "Restored #{file} from GCP (read-only)"
-      if File.exist?("#{file}.readme")
-        File.delete("#{file}.readme")
+  else
+    files = non_flags
+  end
+
+  if files.empty?
+    puts "Usage: gprism pull [--all|-a] [file1 file2 ...]"
+    exit 1
+  end
+
+  pass = get_passphrase(ENV_NS)
+  files.each do |file|
+    name = generate_secret_name(file, ENV_NS)
+    
+    if !gcp_secret_exists?(CONFIG['project_id'], name)
+      warn "Secret #{name} not found in GCP, skipping #{file}."
+      next
+    end
+    
+    enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
+    if enc_content.nil? || enc_content.empty?
+      warn "Failed to fetch content for #{name}"
+      next
+    end
+    
+    if enc_content.start_with?("GPRISM_GCS_URI=")
+      gcs_uri = enc_content.sub("GPRISM_GCS_URI=", "").strip
+      info "Large payload detected. Downloading from GCS: #{gcs_uri}"
+      enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
+      if !$?.success? || enc_content.nil? || enc_content.empty?
+        error "Failed to download payload from GCS: #{gcs_uri}"
       end
     end
     
+    dec_content = decrypt(enc_content, pass)
+    
+    if File.exist?(file)
+      local_content = File.read(file)
+      next unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
+    end
+    
+    FileUtils.mkdir_p(File.dirname(file))
+    File.delete(file) if File.exist?(file)
+    File.write(file, dec_content)
+    File.chmod(0400, file)
+    success "Restored #{file} from GCP (read-only)"
+    if File.exist?("#{file}.readme")
+      File.delete("#{file}.readme")
+    end
+  end
+  
+  if flags.include?("--all") || flags.include?("-a")
     local_enc_files = Dir.glob("**/*.gprenc")
     if local_enc_files.any?
       info "Found #{local_enc_files.size} local .gprenc files. Decrypting..."
@@ -550,8 +572,6 @@ when "pull"
         end
       end
     end
-  else
-    puts "Usage: gprism pull --all"
   end
 
 when "add"
@@ -1096,12 +1116,12 @@ when "show", "inspect", "diff", "describe"
     puts "   #{GREEN}[ + ] Green lines #{RESET}= #{BOLD}HERE#{RESET}  (Local modified version on disk: #{file})"
     show_diff(local_content, remote_content)
     puts "─" * 75
-    puts "💡 #{BOLD}Hint:#{RESET} Local differs from remote! To overwrite remote with local changes, run: #{GREEN}gprism push -a#{RESET} (or gprism push --force)"
-    puts "         To overwrite local changes with remote version, run: #{GREEN}gprism pull -a#{RESET}"
+    puts "💡 #{BOLD}Hint:#{RESET} Local differs from remote! To overwrite remote with local changes, run: #{GREEN}gprism push #{file}#{RESET} (or gprism push --force)"
+    puts "         To overwrite local changes with remote version, run: #{GREEN}gprism pull #{file}#{RESET}"
   elsif local_exists && !remote_exists
-    puts "\n💡 #{BOLD}Hint:#{RESET} To push this new file to remote, run: #{GREEN}gprism add #{file} && gprism push -a#{RESET}"
+    puts "\n💡 #{BOLD}Hint:#{RESET} To push this new file to remote, run: #{GREEN}gprism add #{file} && gprism push #{file}#{RESET}"
   elsif !local_exists && remote_exists
-    puts "\n💡 #{BOLD}Hint:#{RESET} To pull this file from remote, run: #{GREEN}gprism pull -a#{RESET}"
+    puts "\n💡 #{BOLD}Hint:#{RESET} To pull this file from remote, run: #{GREEN}gprism pull #{file}#{RESET}"
   else
     puts "\n✨ #{GREEN}Everything is in sync!#{RESET}"
   end
@@ -1117,8 +1137,8 @@ when "help", "--help", "-h", nil
       init               Initialize the environment, create .env.template, and set up GCS bucket.
       add <file>         Add a file to be tracked and encrypted. (0600 permissions will be set).
       show, inspect <file> Show HERE vs THERE MD5 hashes, timestamps, SM version count, and diffs.
-      push -a            Encrypt and push all tracked files to GCP. Large files (>50KB) route to GCS.
-      pull -a            Decrypt and pull all tracked files from GCP, overwriting local copies.
+      push [-a|--all] [file...] Encrypt and push tracked files to GCP. Large files (>50KB) route to GCS.
+      pull [-a|--all] [file...] Decrypt and pull tracked files from GCP, overwriting local copies.
       encrypt            Locally encrypt files/folders to `.gprenc` and auto git add. Supports `--yes`.
       decrypt            Locally decrypt `.gprenc` files. Usually handled automatically by `pull -a`.
       status, st         Show the status of tracked files (local vs remote).
@@ -1145,8 +1165,8 @@ when "--ai-help"
     - `gprism init`: Creates `.env.template`, `.git-privatize.list`, and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
     - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
     - `gprism show <filepath>` (aliases: `inspect`, `diff`): Displays HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, timestamps, and unified diffs when out of sync.
-    - `gprism push --all` (or `-a`): Loops over tracked files, encrypts them, and pushes. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager. Removes the plaintext file and creates a `.readme`.
-    - `gprism pull --all` (or `-a`): Loops over tracked files, fetches from Secret Manager (and GCS if pointed), decrypts, and restores the plaintext file. It also finds any local `*.gprenc` files and decrypts them.
+    - `gprism push [--all|-a] [file...]`: Encrypts and pushes files (either all tracked files or the specified files) to GCP. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager.
+    - `gprism pull [--all|-a] [file...]`: Decrypts and pulls files from GCP, restoring plaintext files.
     - `gprism encrypt <files>`: Encrypts files offline, adds original to `.gitignore`, and automatically `git add`s the `.gprenc` file. Uses an auto-generated SM key. Use `--yes` to bypass warnings.
     - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
     - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.

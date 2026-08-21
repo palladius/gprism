@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-08-20
+### Added
+- Enabled `gprism push` and `gprism pull` to accept specific file arguments instead of only `--all`.
+- Added usage instructions and hints showing target files to standard help and AI-help screens.
+
 ## [0.3.4] - 2026-07-27
 ### Added
 - Added `gprism show <filepath>` (aliases: `inspect`, `diff`, `describe`) to display a detailed HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, remote timestamps, and unified diffs.
