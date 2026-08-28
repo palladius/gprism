@@ -29,3 +29,9 @@
 ## 🔑 3. Keyring & Altre Feature Esistenti
 - [ ] Test Linux Keyring implementation (`secret-tool` from `libsecret-tools`) on a Linux computer to verify if `gprism` correctly saves and reads the passphrase.
 - [ ] Support adding folders. (Note: this is HARD as it implies potentially 100s of files. Probably the right thing is NOT to support them and only allow individual files).
+
+££ Aggiunti da Riccarod il 28 aug... da integrare
+
+1. aggiungi un gprism doctor che verifica tante cose, statistiche come numero di secrets, ... (o forse uno stats per quello?) e verifica che il bucket sia PRIVATO cacchio!
+2. in ricc-mac assicurati di ripulire gprism-worktree - che cacchio c'e' li?
+
