@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-09-09
+### Added
+- Added `--version`, `-v`, and `version` commands/flags to display current gprism version.
+
+### Changed
+- Propagated `GPRISM_IDENTITY` to `ENV['CLOUDSDK_CORE_ACCOUNT']` so GCP commands correctly authenticate with the configured identity.
+- Improved error handling for GCP Secret Manager and GCS: explicit detection and reporting of `PERMISSION_DENIED`, authentication token expiration/revocation (`invalid_grant`), or missing credentials rather than silently reporting remote secrets as missing.
+
 ## [0.3.5] - 2026-08-20
 ### Added
 - Enabled `gprism push` and `gprism pull` to accept specific file arguments instead of only `--all`.

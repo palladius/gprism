@@ -21,34 +21,24 @@ class TestGprism < Minitest::Test
     system("git init >/dev/null 2>&1")
     
     # Create test .env config
+    @identity = ENV['GPRISM_TEST_IDENTITY'] || 'ricc@gcp.altostrat.com'
     File.write(".env", <<~ENV)
       GPRISM_PROJECT_ID=palladius-genai
-      GPRISM_IDENTITY=palladiusbonton@gmail.com
+      GPRISM_IDENTITY=#{@identity}
       GPRISM_ENVIRONMENT=test
     ENV
     
     ENV['GIT_PRIVATIZE_KEY'] = 'test-encryption-key-123'
     
-    # Create a secret file to privatize
-    @secret_file = "my_secret_file.txt"
-    @secret_content = "super_secret_value_#{Time.now.to_i}"
+    # Clean up any pre-existing secret before running
+    @test_id = "#{Time.now.to_i}-#{rand(1000..9999)}"
+    @secret_name = "test--unknown-repo--my-secret-file-#{@test_id}-txt"
+    @secret_file = "my-secret-file-#{@test_id}.txt"
+    @secret_content = "super_secret_value_#{@test_id}"
     File.write(@secret_file, @secret_content)
     
     # Create git-privatize.list
     File.write(".git-privatize.list", "#{@secret_file}\n")
-    
-    url = `git config --get remote.origin.url 2>/dev/null`.strip
-    if url.empty?
-      repo_slug = "unknown-repo"
-    else
-      if url.include?(":") && !url.start_with?("http")
-        url = url.split(":", 2).last
-      end
-      url = url.sub(%r{^https?://[^/]+/}, "")
-      url = url.sub(/\.git$/, "")
-      repo_slug = url.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
-    end
-    @secret_name = "test--#{repo_slug}--my-secret-file-txt"
   end
 
   def teardown
@@ -77,7 +67,7 @@ class TestGprism < Minitest::Test
     assert_includes File.read(".gitignore"), @secret_file
     
     # Verify GCP secret is encrypted
-    enc_content = `gcloud secrets versions access latest --secret=#{@secret_name} --project=palladius-genai 2>/dev/null`.strip
+    enc_content = `gcloud secrets versions access latest --secret=#{@secret_name} --project=palladius-genai --account=#{@identity} 2>/dev/null`.strip
     require 'base64'
     decoded_enc_content = Base64.strict_decode64(enc_content)
     assert decoded_enc_content.start_with?("Salted__"), "GCP secret should be encrypted"
@@ -153,6 +143,14 @@ class TestGprism < Minitest::Test
     out = `#{@bin}`.gsub(/\e\[\d+m/, '')
     assert_includes out, "Usage:"
     assert_includes out, "show, inspect <file>"
+  end
+
+  def test_version_flags
+    ["--version", "-v", "version"].each do |flag|
+      out = `#{@bin} #{flag}`.strip
+      assert_equal "gprism 0.3.6", out
+      assert_equal 0, $?.exitstatus
+    end
   end
 
   def test_show_and_modified_status

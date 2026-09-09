@@ -45,6 +45,14 @@ YELLOW = "\e[33m"
 BOLD   = "\e[1m"
 RESET  = "\e[0m"
 
+VERSION_FILE = File.expand_path("../VERSION", __dir__)
+GPRISM_VERSION = File.exist?(VERSION_FILE) ? File.read(VERSION_FILE).strip : "0.3.6"
+
+if ARGV[0] == "--version" || ARGV[0] == "version" || ((ARGV[0] == "-v" || ARGV[0] == "-V") && ARGV.size == 1)
+  puts "gprism #{GPRISM_VERSION}"
+  exit 0
+end
+
 def info(msg) puts "#{CYAN}INFO:#{RESET} #{msg}" end
 def success(msg) puts "#{GREEN}SUCCESS:#{RESET} #{msg}" end
 def error(msg) puts "#{RED}ERROR:#{RESET} #{msg}"; exit 1 end
@@ -228,8 +236,58 @@ def gcs_initialized?(bucket_name)
   system("gcloud storage buckets describe #{Shellwords.escape(bucket_name)} >/dev/null 2>&1")
 end
 
+def check_gcp_error!(project, stderr, context_msg = nil)
+  return if stderr.nil? || stderr.empty?
+
+  # Check for permission denied, invalid grant, or missing credentials
+  is_auth_error = stderr.include?("PERMISSION_DENIED") ||
+                  stderr.include?("does not have permission to access") ||
+                  stderr.include?("invalid_grant") ||
+                  stderr.include?("Token has been expired or revoked") ||
+                  stderr.include?("does not have any valid credentials") ||
+                  stderr.include?("reauthenticate")
+
+  return unless is_auth_error
+
+  active_account = ENV['CLOUDSDK_CORE_ACCOUNT']
+  if active_account.nil? || active_account.empty?
+    active_account = `gcloud config get-value account 2>/dev/null`.strip
+  end
+  active_account = "current account" if active_account.nil? || active_account.empty?
+
+  first_line = stderr.lines.find { |l| l.include?("ERROR:") } || stderr.lines.first || ""
+  summary = first_line.strip.sub(/^ERROR:\s*\([^)]+\)\s*/, '')
+
+  # Build actionable advice based on the failure
+  advice = []
+  if stderr.include?("invalid_grant") || stderr.include?("Token has been expired") || stderr.include?("reauthenticate") || stderr.include?("does not have any valid credentials")
+    advice << "To re-authenticate this account (gcloud CLI + ADC credentials), run:"
+    if active_account != "current account"
+      advice << "  #{GREEN}gcloud auth login #{Shellwords.escape(active_account)} --update-adc#{RESET}"
+    else
+      advice << "  #{GREEN}gcloud auth login --update-adc#{RESET}"
+    end
+  elsif stderr.include?("PERMISSION_DENIED") || stderr.include?("does not have permission")
+    advice << "The account is logged in, but lacks permissions on GCP project '#{project}'."
+    advice << "1. Verify you are using the intended account. To switch or login as another identity:"
+    advice << "   #{GREEN}gcloud config set account <YOUR_EMAIL>#{RESET} (or export GPRISM_IDENTITY=<YOUR_EMAIL>)"
+    advice << "2. Or ask the project owner/admin to grant roles/secretmanager.secretAccessor to #{active_account}."
+  end
+
+  error_msg = "Sorry, cannot access project '#{project}' as #{active_account}: #{summary}"
+  error_msg += "\n(Action: #{context_msg})" if context_msg
+  if advice.any?
+    error_msg += "\n\n💡 #{BOLD}How to fix this:#{RESET}\n" + advice.join("\n")
+  end
+  error error_msg
+end
+
 def gcp_secret_exists?(project, name)
-  system("gcloud secrets describe #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} >/dev/null 2>&1")
+  stdout, stderr, status = Open3.capture3("gcloud secrets describe #{Shellwords.escape(name)} --project=#{Shellwords.escape(project)}")
+  return true if status.success?
+
+  check_gcp_error!(project, stderr, "checking if secret exists")
+  false
 end
 
 def create_gcp_secret(project, secret_name)
@@ -237,6 +295,7 @@ def create_gcp_secret(project, secret_name)
     cmd = "gcloud secrets create #{Shellwords.escape(secret_name)} --replication-policy=\"automatic\" --project=#{Shellwords.escape(project)}"
     stdout, stderr, status = Open3.capture3(cmd)
     unless status.success?
+      check_gcp_error!(project, stderr, "creating secret #{secret_name}")
       raise "Failed to create secret #{secret_name}:\n#{stderr}"
     end
   end
@@ -246,17 +305,30 @@ def add_gcp_secret_version(project, secret_name, secret_data)
   cmd = "gcloud secrets versions add #{Shellwords.escape(secret_name)} --data-file=- --project=#{Shellwords.escape(project)}"
   stdout, stderr, status = Open3.capture3(cmd, stdin_data: secret_data)
   unless status.success?
+    check_gcp_error!(project, stderr, "adding version to secret #{secret_name}")
     raise "Failed to add secret version to #{secret_name}:\n#{stderr}"
   end
   true
 end
 
 def fetch_gcp_secret_version(project, name)
-  `gcloud secrets versions access latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} 2>/dev/null`
+  stdout, stderr, status = Open3.capture3("gcloud secrets versions access latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)}")
+  if status.success?
+    return stdout
+  end
+
+  check_gcp_error!(project, stderr, "accessing secret #{name}")
+  nil
 end
 
 def fetch_gcp_secret_timestamp(project, name)
-  `gcloud secrets versions describe latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --format="value(createTime)" 2>/dev/null`.strip
+  stdout, stderr, status = Open3.capture3("gcloud secrets versions describe latest --secret=#{Shellwords.escape(name)} --project=#{Shellwords.escape(project)} --format=\"value(createTime)\"")
+  if status.success?
+    return stdout.strip
+  end
+
+  check_gcp_error!(project, stderr, "describing secret #{name}")
+  ""
 end
 
 def show_diff(local_content, remote_content)
@@ -386,6 +458,9 @@ def check_git_ignored_status(file)
 end
 
 CONFIG = load_config
+if CONFIG['identity'] && !CONFIG['identity'].empty?
+  ENV['CLOUDSDK_CORE_ACCOUNT'] = CONFIG['identity']
+end
 env_status = check_git_ignored_status('.env')
 if env_status == :tracked
   puts "#{RED}DANGER: Secret file .env is tracked in Git!#{RESET}"
@@ -908,9 +983,15 @@ when "list", "ls"
   end
   
   puts "#{CYAN}Fetching secrets from GCP Project: #{CONFIG['project_id']}...#{RESET}"
-  secrets_json = `gcloud secrets list --project=#{Shellwords.escape(CONFIG['project_id'])} --format=json 2>/dev/null`
-  if secrets_json.nil? || secrets_json.strip.empty?
-    warn "Failed to fetch secrets or no secrets found."
+  stdout, stderr, status = Open3.capture3("gcloud secrets list --project=#{Shellwords.escape(CONFIG['project_id'])} --format=json")
+  unless status.success?
+    check_gcp_error!(CONFIG['project_id'], stderr, "listing secrets")
+    warn "Failed to fetch secrets: #{stderr.strip}"
+    exit 0
+  end
+  secrets_json = stdout
+  if secrets_json.strip.empty?
+    warn "No secrets found."
     exit 0
   end
   
@@ -1145,6 +1226,7 @@ when "help", "--help", "-h", nil
       list, ls           List files tracked in GCP for the current environment and repository.
                          Use `--all` to show all repositories.
       help               Show this help message.
+      --version, -v      Show gprism version.
       --ai-help          Show AI-friendly CLI documentation.
 
     Environment Variables:
@@ -1171,6 +1253,7 @@ when "--ai-help"
     - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
     - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.
     - `gprism list` (or `ls`): Queries GCP Secret Manager and GCS directly to list all secrets for the current repository and environment. Can be filtered with `--all`.
+    - `gprism --version`: Prints gprism version.
     
     ## Storage Paradigm
     - Small Text Files (< 50KB): Encrypted and stored natively in Google Secret Manager.
@@ -1178,5 +1261,5 @@ when "--ai-help"
   AI_HELP
 
 else
-  puts "Usage: gprism [init|add|show|inspect|diff|push|pull|encrypt|decrypt|status|st|list|ls|help] <args>"
+  puts "Usage: gprism [init|add|show|inspect|diff|push|pull|encrypt|decrypt|status|st|list|ls|help|version|--version] <args>"
 end
