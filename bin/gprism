@@ -1280,19 +1280,23 @@ when "help", "--help", "-h", nil
       gprism <command> [options]
 
     Commands:
-      init               Initialize the environment, create .env.template, and set up GCS bucket.
+      init               Initialize environment, set up GCS bucket, and auto-seed .env into .git-privatize.list.
       add <file>         Add a file to be tracked and encrypted. (0600 permissions will be set).
       show, inspect <file> Show HERE vs THERE MD5 hashes, timestamps, SM version count, and diffs.
       push [-a|--all] [file...] Encrypt and push tracked files to GCP. Large files (>50KB) route to GCS.
       pull [-a|--all] [file...] Decrypt and pull tracked files from GCP, overwriting local copies.
       encrypt            Locally encrypt files/folders to `.gprenc` and auto git add. Supports `--yes`.
       decrypt            Locally decrypt `.gprenc` files. Usually handled automatically by `pull -a`.
-      status, st         Show the status of tracked files (local vs remote).
+      status, st         Show status of tracked and untracked secrets. Supports `--fix` to auto-repair.
       list, ls           List files tracked in GCP for the current environment and repository.
                          Use `--all` to show all repositories.
       help               Show this help message.
       --version, -v      Show gprism version.
       --ai-help          Show AI-friendly CLI documentation.
+
+    Flags:
+      --fix, --git-ignore Auto-repair untracked secrets into .git-privatize.list and update .gitignore.
+      --force, -f        Force push secrets even if MD5 matches remote.
 
     Environment Variables:
       GPRISM_PROJECT_ID    Your GCP project ID.
@@ -1309,14 +1313,14 @@ when "--ai-help"
     `gprism` is a CLI tool that encrypts local repository secrets using a symmetric key, then uploads them to GCP Secret Manager (for small text files) or GCS (for large/binary files).
     
     ## Commands
-    - `gprism init`: Creates `.env.template`, `.git-privatize.list`, and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
-    - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
-    - `gprism show <filepath>` (aliases: `inspect`, `diff`): Displays HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, timestamps, and unified diffs when out of sync.
-    - `gprism push [--all|-a] [file...]`: Encrypts and pushes files (either all tracked files or the specified files) to GCP. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager.
+    - `gprism init`: Creates `.git-privatize.list` (auto-seeding `.env` if present) and initializes GCS bucket named `gs://$PROJECT_ID-gprism`.
+    - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Auto-stages `.env` if creating the list file for the first time. Halts if file is >50KB/binary without initialized GCS.
+    - `gprism show <filepath>` (aliases: `inspect`, `diff`, `describe`): Displays HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, timestamps, and unified diffs when out of sync.
+    - `gprism push [--all|-a] [file...]`: Encrypts and pushes files to GCP (Secret Manager or GCS for >60KB payloads). Automatically registers pushed files in `.git-privatize.list` and `.gitignore`. Warns if untracked `.env` is detected.
     - `gprism pull [--all|-a] [file...]`: Decrypts and pulls files from GCP, restoring plaintext files.
-    - `gprism encrypt <files>`: Encrypts files offline, adds original to `.gitignore`, and automatically `git add`s the `.gprenc` file. Uses an auto-generated SM key. Use `--yes` to bypass warnings.
+    - `gprism encrypt <files>`: Encrypts files offline to `.gprenc`, adds original to `.gitignore`, and auto git-adds the `.gprenc` file.
     - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
-    - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.
+    - `gprism status` (or `st`): Compares local files against remote Secret Manager/GCS (`✅ Sync`, `⚠️ M`, `❌ Miss`). Actively detects untracked secret files (`⚠️ Untracked`) like `.env`. Supports `--fix` (or `--git-ignore`) to automatically add untracked secrets to `.git-privatize.list` and `.gitignore`.
     - `gprism list` (or `ls`): Queries GCP Secret Manager and GCS directly to list all secrets for the current repository and environment. Can be filtered with `--all`.
     - `gprism --version`: Prints gprism version.
     

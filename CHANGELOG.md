@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated `gprism init` to automatically seed `.env` into `.git-privatize.list` if present on disk.
 - Updated `gprism add` to automatically stage `.env` when creating `.git-privatize.list` for the first time.
 - Updated `gprism push` to automatically register successfully pushed secret files into `.git-privatize.list`.
+- Updated `docs/USER_GUIDE.md`, CLI `--help`, and `--ai-help` documentation with untracked secret detection and self-healing `--fix` workflow.
 
 ## [0.3.6] - 2026-09-09
 ### Added
