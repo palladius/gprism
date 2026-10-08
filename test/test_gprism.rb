@@ -148,9 +148,38 @@ class TestGprism < Minitest::Test
   def test_version_flags
     ["--version", "-v", "version"].each do |flag|
       out = `#{@bin} #{flag}`.strip
-      assert_equal "gprism 0.3.6", out
+      assert_equal "gprism 0.3.7", out
       assert_equal 0, $?.exitstatus
     end
+  end
+
+  def test_untracked_env_in_status_and_auto_fix
+    # In setup, .git-privatize.list has only @secret_file, so .env is untracked
+    status_out = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    assert_includes status_out, "⚠️ Untracked"
+    assert_includes status_out, "WARN: 1 secret file(s) exist but are NOT tracked in .git-privatize.list!"
+    assert_includes status_out, ".env"
+    assert_includes status_out, "gprism status --fix"
+
+    # Now run status --fix
+    fix_out = `#{@bin} status --fix`.gsub(/\e\[\d+m/, '')
+    assert_includes fix_out, "Auto-fixing .git-privatize.list"
+    assert_includes File.read(".git-privatize.list"), ".env"
+
+    # Now run status again: .env is no longer untracked
+    status_out_after = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    refute_includes status_out_after, "⚠️ Untracked"
+    refute_includes status_out_after, "NOT tracked in .git-privatize.list"
+  end
+
+  def test_init_auto_seeds_env
+    File.delete(".git-privatize.list") if File.exist?(".git-privatize.list")
+    assert File.exist?(".env")
+
+    out = `#{@bin} init`.gsub(/\e\[\d+m/, '')
+    assert File.exist?(".git-privatize.list")
+    assert_includes File.read(".git-privatize.list"), ".env"
+    assert_includes out, "Added .env to .git-privatize.list"
   end
 
   def test_show_and_modified_status

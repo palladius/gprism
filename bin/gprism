@@ -46,7 +46,7 @@ BOLD   = "\e[1m"
 RESET  = "\e[0m"
 
 VERSION_FILE = File.expand_path("../VERSION", __dir__)
-GPRISM_VERSION = File.exist?(VERSION_FILE) ? File.read(VERSION_FILE).strip : "0.3.6"
+GPRISM_VERSION = File.exist?(VERSION_FILE) ? File.read(VERSION_FILE).strip : "0.3.7"
 
 if ARGV[0] == "--version" || ARGV[0] == "version" || ((ARGV[0] == "-v" || ARGV[0] == "-V") && ARGV.size == 1)
   puts "gprism #{GPRISM_VERSION}"
@@ -213,6 +213,11 @@ end
 def list_files
   return [] unless File.exist?('.git-privatize.list')
   File.readlines('.git-privatize.list').map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
+end
+
+def env_opted_out?
+  return false unless File.exist?('.git-privatize.list')
+  File.readlines('.git-privatize.list').map(&:strip).any? { |l| l.match(/^#\s*\.env$/) }
 end
 
 def get_local_encryption_key(project, env, repo)
@@ -483,6 +488,15 @@ when "init"
     success "Created .git-privatize.list"
   end
   
+  if File.exist?(".env")
+    lines = File.readlines(".git-privatize.list").map(&:strip)
+    unless lines.include?(".env") || env_opted_out?
+      File.open(".git-privatize.list", "a") { |f| f.puts ".env" }
+      success "Added .env to .git-privatize.list"
+      update_gitignore([".env"])
+    end
+  end
+  
   bucket_name = CONFIG['gcs_bucket'] || "gs://#{CONFIG['project_id']}-gprism"
   unless bucket_name.start_with?("gs://")
     bucket_name = "gs://#{bucket_name}"
@@ -504,6 +518,9 @@ when "push"
 
   if flags.include?("--all") || flags.include?("-a")
     files = list_files
+    if File.exist?('.env') && !files.include?('.env') && !env_opted_out?
+      warn "Untracked secret .env detected on disk! Run 'gprism add .env' to track and push it (or 'gprism status --fix')."
+    end
   else
     files = non_flags
   end
@@ -563,6 +580,13 @@ when "push"
     if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
       success "Pushed #{file} to Secret Manager as #{name}"
       update_gitignore([file])
+      if File.exist?('.git-privatize.list')
+        current_list = File.readlines('.git-privatize.list').map(&:strip)
+        unless current_list.include?(file)
+          File.open('.git-privatize.list', 'a') { |f| f.puts file }
+          info "Added #{file} to .git-privatize.list"
+        end
+      end
     else
       error "Failed to push #{file}"
     end
@@ -682,7 +706,16 @@ when "add"
   end
   
   list_file = '.git-privatize.list'
-  lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
+  is_new_list = !File.exist?(list_file)
+  lines = is_new_list ? [] : File.readlines(list_file).map(&:strip)
+  
+  if is_new_list && File.exist?('.env') && file != '.env' && !env_opted_out?
+    File.open(list_file, "a") { |f| f.puts ".env" }
+    success "Automatically added .env to #{list_file}"
+    update_gitignore([".env"])
+    lines << ".env"
+  end
+
   unless lines.include?(file)
     File.open(list_file, "a") { |f| f.puts file }
     success "Added #{file} to #{list_file}"
@@ -767,15 +800,27 @@ when "decrypt"
 
 when "status", "st"
   files = list_files
-  if files.empty?
+  untracked_secrets = []
+
+  # Detect untracked .env if present locally or in Secret Manager
+  unless env_opted_out? || files.include?('.env')
+    env_secret_name = generate_secret_name('.env', ENV_NS)
+    if File.exist?('.env') || gcp_secret_exists?(CONFIG['project_id'], env_secret_name)
+      untracked_secrets << '.env'
+    end
+  end
+
+  all_files = (files + untracked_secrets).uniq
+
+  if all_files.empty?
     info "No files listed in .git-privatize.list"
     exit 0
   end
   puts "Gprism Status (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
   
   # Carlessian alignment padding
-  max_file_len = files.map(&:length).max || 0
-  names = files.map { |f| generate_secret_name(f, ENV_NS) }
+  max_file_len = all_files.map(&:length).max || 0
+  names = all_files.map { |f| generate_secret_name(f, ENV_NS) }
   max_name_len = names.map(&:length).max || 0
   
   verbose = ARGV.include?("--verbose") || ARGV.include?("-v")
@@ -785,8 +830,12 @@ when "status", "st"
   diffs_to_show = []
   tracked_files = []
   not_ignored_files = []
+  not_listed_files = []
   
-  files.each do |file|
+  all_files.each do |file|
+    is_untracked = untracked_secrets.include?(file)
+    not_listed_files << file if is_untracked
+
     status_sym = check_git_ignored_status(file)
     tracked_files << file if status_sym == :tracked
     not_ignored_files << file if status_sym == :not_ignored
@@ -873,6 +922,7 @@ when "status", "st"
     end
     
     status = []
+    status << "#{YELLOW}⚠️ Untracked#{RESET}" if is_untracked
     status << sync_state if sync_state
     
     if remote_type
@@ -954,6 +1004,21 @@ when "status", "st"
       system(cmd)
     else
       puts "#{YELLOW}Run this to fix it: #{cmd}#{RESET}"
+    end
+  end
+
+  if not_listed_files.any?
+    puts "\n#{YELLOW}WARN: #{not_listed_files.size} secret file(s) exist but are NOT tracked in .git-privatize.list!#{RESET}"
+    not_listed_files.each do |f|
+      puts "  - #{CYAN}#{f}#{RESET}"
+    end
+    cmd = "(cd $(git rev-parse --show-toplevel) && printf \"%s\\n\" " + not_listed_files.map { |f| Shellwords.escape(f) }.join(" ") + " >> .git-privatize.list)"
+    if auto_fix
+      puts "#{YELLOW}Auto-fixing .git-privatize.list: #{cmd}#{RESET}"
+      system(cmd)
+      update_gitignore(not_listed_files)
+    else
+      puts "#{YELLOW}Run this to track them: #{cmd} (or run 'gprism status --fix')#{RESET}"
     end
   end
 

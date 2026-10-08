@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-10-08
+### Fixed
+- Fixed critical blind spot where `.env` and untracked secret files were silently excluded from `gprism status`, misleading users with a false `[ ✅ Sync ]` state when secrets were modified or unbacked up (fixes #9).
+- `gprism status` now detects untracked secret files (`.env`) and displays an explicit `⚠️ Untracked` badge alongside sync state and remote status.
+- Added self-healing auto-fix via `gprism status --fix` (and `--git-ignore`) to automatically add untracked secret files to `.git-privatize.list` and `.gitignore`.
+- Updated `gprism init` to automatically seed `.env` into `.git-privatize.list` if present on disk.
+- Updated `gprism add` to automatically stage `.env` when creating `.git-privatize.list` for the first time.
+- Updated `gprism push` to automatically register successfully pushed secret files into `.git-privatize.list`.
+
 ## [0.3.6] - 2026-09-09
 ### Added
 - Added `--version`, `-v`, and `version` commands/flags to display current gprism version.
