@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-10-11
+### Added
+- Added comprehensive unit tests for `gprism --help`, `help`, and `gprism --ai-help` flags (closes #6).
+- Documented and verified GCS routing and validation (`>50KB` and binary detection with intelligent break if GCS uninitialized).
+- Updated version testing to dynamically verify against `VERSION` file.
+
 ## [0.3.7] - 2026-10-08
 ### Fixed
 - Fixed critical blind spot where `.env` and untracked secret files were silently excluded from `gprism status`, misleading users with a false `[ ✅ Sync ]` state when secrets were modified or unbacked up (fixes #9).

@@ -146,11 +146,27 @@ class TestGprism < Minitest::Test
   end
 
   def test_version_flags
+    expected_version = File.read(File.join(@workdir, "VERSION")).strip
     ["--version", "-v", "version"].each do |flag|
       out = `#{@bin} #{flag}`.strip
-      assert_equal "gprism 0.3.7", out
+      assert_equal "gprism #{expected_version}", out
       assert_equal 0, $?.exitstatus
     end
+  end
+
+  def test_help_and_ai_help_flags
+    help_out = `#{@bin} --help`.gsub(/\e\[\d+m/, '')
+    assert_includes help_out, "Usage:"
+    assert_includes help_out, "--ai-help"
+    assert_includes help_out, "gprism <command> [options]"
+    assert_equal 0, $?.exitstatus
+
+    ai_help_out = `#{@bin} --ai-help`.gsub(/\e\[\d+m/, '')
+    assert_includes ai_help_out, "# gprism AI Help Documentation"
+    assert_includes ai_help_out, "Storage Paradigm"
+    assert_includes ai_help_out, "Small Text Files (< 50KB)"
+    assert_includes ai_help_out, "Large / Binary Files"
+    assert_equal 0, $?.exitstatus
   end
 
   def test_untracked_env_in_status_and_auto_fix
