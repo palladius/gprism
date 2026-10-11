@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-10-27
+### Added
+- Added comprehensive unit tests for `gprism --help`, `help`, and `gprism --ai-help` flags (closes #6).
+- Documented and verified GCS routing and validation (`>50KB` and binary detection with intelligent break if GCS uninitialized).
+- Updated version testing to dynamically verify against `VERSION` file.
+
 ## [0.3.8] - 2026-10-14
 ### Added
 - 🔵 📜 **Carlessian Constitution v1.1 (Bye-bye `.git-privatize.list`!):** Moved local tracking cache out of the Git Root into `GITROOT/.cache/gprism/tracked.list` (and remote diffs into `GITROOT/.cache/gprism/remote/`), keeping legacy `.git-privatize.list` read-fallback & auto-migration for backward compatibility. Clarified Article 8 so `GPRISM_*` overrides live in `GITROOT/.env` while tracked secret files (e.g. `.env`, `OTHER_DIR/.env`, `private/...`) can reside anywhere within the Git Root boundaries.
