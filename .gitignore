@@ -13,8 +13,9 @@
 test/.env-per-finta
 test/subfolder/new_secret.txt
 
-# Gprism runtime cache (contains decrypted secrets!)
+# Gprism runtime cache (contains decrypted secrets and local tracking cache!)
 .gprism/
+.cache/
 
 # Manual testing artifacts
 manual_test/

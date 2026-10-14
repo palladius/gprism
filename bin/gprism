@@ -1,4 +1,11 @@
 #!/usr/bin/env ruby
+
+=begin
+gprism - Git-Privatize Replacement In Secret Manager (and GCS)
+Encrypts and syncs repository secrets across GCP Secret Manager (🔑 SM),
+Google Cloud Storage (🪣 GS), and local encrypted files (🔐 GP).
+=end
+
 require 'yaml'
 require 'openssl'
 require 'digest'
@@ -210,9 +217,190 @@ def generate_secret_name(filepath, env)
   name
 end
 
+CACHE_DIR = ".cache/gprism"
+TRACKED_CACHE_FILE = ".cache/gprism/tracked.list"
+LEGACY_LIST_FILE = ".git-privatize.list"
+
 def list_files
-  return [] unless File.exist?('.git-privatize.list')
-  File.readlines('.git-privatize.list').map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
+  files = []
+  [TRACKED_CACHE_FILE, LEGACY_LIST_FILE].each do |path|
+    next unless File.exist?(path)
+    files.concat(File.readlines(path).map(&:strip).reject { |l| l.empty? || l.start_with?('#') })
+  end
+  files.uniq
+end
+
+def add_to_privatize_list(file, quiet: false)
+  FileUtils.mkdir_p(CACHE_DIR)
+  update_gitignore([".cache/"])
+
+  lines = list_files
+  already_in_cache = File.exist?(TRACKED_CACHE_FILE) &&
+                     File.readlines(TRACKED_CACHE_FILE).map(&:strip).include?(file)
+
+  if already_in_cache
+    info "#{file} is already in #{TRACKED_CACHE_FILE}" unless quiet
+    return false
+  end
+
+  # Also migrate any legacy entries if creating tracked.list for the first time
+  to_write = (lines + [file]).uniq
+  existing_cache = File.exist?(TRACKED_CACHE_FILE) ? File.readlines(TRACKED_CACHE_FILE).map(&:strip) : []
+  missing_from_cache = to_write - existing_cache
+
+  content = File.exist?(TRACKED_CACHE_FILE) ? File.read(TRACKED_CACHE_FILE) : ""
+  needs_newline = !content.empty? && !content.end_with?("\n")
+  File.open(TRACKED_CACHE_FILE, "a") do |f|
+    f.puts if needs_newline
+    missing_from_cache.each { |item| f.puts item }
+  end
+  success "Added #{file} to #{TRACKED_CACHE_FILE}" unless quiet
+  true
+end
+
+def encode_filepath_annotation(filepath)
+  Base64.urlsafe_encode64(filepath, padding: false)
+end
+
+def decode_filepath_annotation(annotations)
+  return nil unless annotations.is_a?(Hash)
+  b64 = annotations["gprism-path-b64"]
+  if b64 && !b64.empty?
+    begin
+      return Base64.urlsafe_decode64(b64)
+    rescue ArgumentError
+      # ignore invalid base64
+    end
+  end
+  annotations["gprism-path"]
+end
+
+def infer_filepath_from_slug(slug)
+  return ".env" if slug == "env"
+  return ".env.#{$1}" if slug =~ /\Aenv-([a-zA-Z0-9_]+)\z/
+
+  dir_parts = []
+  rem = slug.dup
+
+  loop do
+    current_base = dir_parts.empty? ? "." : File.join(*dir_parts)
+    subdirs = []
+    if Dir.exist?(current_base)
+      subdirs = Dir.children(current_base).select do |entry|
+        !entry.start_with?(".git") && entry != ".cache" && entry != "node_modules" && entry != ".venv" &&
+          File.directory?(File.join(current_base, entry))
+      end
+    end
+    subdirs |= ["private"] if dir_parts.empty?
+
+    matched_dir = subdirs.sort_by { |d| -d.length }.find do |d|
+      d_slug = d.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+      !d_slug.empty? && rem.downcase.start_with?("#{d_slug.downcase}-") && rem.length > d_slug.length + 1
+    end
+
+    if matched_dir
+      d_slug = matched_dir.gsub(/[^a-zA-Z0-9]/, '-').gsub(/-+/, '-').sub(/^-/, '').sub(/-$/, '')
+      rem = rem[(d_slug.length + 1)..-1]
+      dir_parts << matched_dir
+    else
+      break
+    end
+  end
+
+  filename = if rem == "env"
+               ".env"
+             elsif rem =~ /\Aenv-([a-zA-Z0-9_]+)\z/
+               ".env.#{$1}"
+             elsif rem =~ /\A(.+)-(sql-gz|tar-gz)\z/i
+               "#{$1}.#{$2.tr('-', '.')}"
+             elsif rem =~ /\A(.+)-(md|json|yaml|yml|txt|csv|jpg|jpeg|png|gif|webp|svg|pdf|sh|bash|zsh|rb|py|js|ts|pem|key|crt|cer|p12|pfx|der|db|sqlite|sqlite3|toml|ini|conf|cfg|log|html|xml|zip|enc)\z/i
+               "#{$1}.#{$2}"
+             else
+               rem
+             end
+
+  dir_parts.empty? ? filename : File.join(*dir_parts, filename)
+end
+
+def local_candidate_paths
+  candidates = []
+  if File.exist?(".gitignore")
+    File.readlines(".gitignore").each do |line|
+      l = line.strip
+      next if l.empty? || l.start_with?("#", "!") || l.include?("*") || l.end_with?("/")
+      candidates << l.sub(%r{\A/+}, "")
+    end
+  end
+  Dir.glob("{.env*,**/.env*,private/**/*,config/**/*,test/**/*}", File::FNM_DOTMATCH).each do |p|
+    next if File.directory?(p) || p.end_with?(".gprenc", ".readme")
+    candidates << p
+  end
+  candidates.uniq
+end
+
+def resolve_filepath_for_secret(secret_obj, env, repo_slug, known_files = [])
+  secret_name = secret_obj["name"].to_s.split("/").last
+  prefix = "#{env}--#{repo_slug}--"
+
+  exact_known = known_files.find { |f| generate_secret_name(f, env) == secret_name }
+  return exact_known if exact_known
+
+  annot_path = decode_filepath_annotation(secret_obj["annotations"])
+  return annot_path if annot_path && !annot_path.empty?
+
+  candidate_match = local_candidate_paths.find { |c| generate_secret_name(c, env) == secret_name }
+  return candidate_match if candidate_match
+
+  if secret_name.start_with?(prefix)
+    slug = secret_name[prefix.length..-1]
+    return infer_filepath_from_slug(slug)
+  end
+
+  secret_name
+end
+
+def fetch_remote_repo_secrets(project, env, repo_slug)
+  return [] if repo_slug.nil? || repo_slug.empty? || repo_slug == "unknown-repo"
+  require 'json'
+  prefix = "#{env}--#{repo_slug}--"
+  cmd = "gcloud secrets list --project=#{Shellwords.escape(project)} --filter=name:#{Shellwords.escape(prefix)} --format=json --quiet"
+  stdout, stderr, status = Open3.capture3(cmd)
+  unless status.success?
+    check_gcp_error!(project, stderr, "listing remote secrets for #{repo_slug}")
+    return []
+  end
+  return [] if stdout.strip.empty?
+  secrets = JSON.parse(stdout) rescue []
+  secrets.select do |s|
+    short_name = s["name"].to_s.split("/").last
+    short_name.start_with?(prefix) && short_name != "#{prefix}local-encryption-key"
+  end
+end
+
+def discover_files(project, env, update_cache: false)
+  files = list_files
+  repo_slug = get_repo_slug
+  return files if repo_slug == "unknown-repo"
+
+  remote_secrets = fetch_remote_repo_secrets(project, env, repo_slug)
+  remote_secrets.each do |s|
+    secret_name = s["name"].to_s.split("/").last
+    existing_match = files.find { |f| generate_secret_name(f, env) == secret_name }
+    resolved_path = existing_match || resolve_filepath_for_secret(s, env, repo_slug, files)
+
+    # Backfill annotation in Secret Manager if missing
+    if decode_filepath_annotation(s["annotations"]).nil? && resolved_path && !resolved_path.empty?
+      ensure_gcp_secret_path_annotation(project, secret_name, resolved_path)
+    end
+
+    next if existing_match
+
+    files << resolved_path
+    if update_cache
+      add_to_privatize_list(resolved_path, quiet: true)
+    end
+  end
+  files.uniq
 end
 
 def get_local_encryption_key(project, env, repo)
@@ -290,15 +478,27 @@ def gcp_secret_exists?(project, name)
   false
 end
 
-def create_gcp_secret(project, secret_name)
+def create_gcp_secret(project, secret_name, filepath = nil)
   unless gcp_secret_exists?(project, secret_name)
-    cmd = "gcloud secrets create #{Shellwords.escape(secret_name)} --replication-policy=\"automatic\" --project=#{Shellwords.escape(project)}"
+    annot_flag = ""
+    if filepath && !filepath.empty?
+      b64 = encode_filepath_annotation(filepath)
+      annot_flag = " --set-annotations=gprism-path-b64=#{Shellwords.escape(b64)}"
+    end
+    cmd = "gcloud secrets create #{Shellwords.escape(secret_name)} --replication-policy=\"automatic\"#{annot_flag} --project=#{Shellwords.escape(project)}"
     stdout, stderr, status = Open3.capture3(cmd)
     unless status.success?
       check_gcp_error!(project, stderr, "creating secret #{secret_name}")
       raise "Failed to create secret #{secret_name}:\n#{stderr}"
     end
   end
+end
+
+def ensure_gcp_secret_path_annotation(project, secret_name, filepath)
+  return if filepath.nil? || filepath.empty?
+  b64 = encode_filepath_annotation(filepath)
+  cmd = "gcloud secrets update #{Shellwords.escape(secret_name)} --update-annotations=gprism-path-b64=#{Shellwords.escape(b64)} --project=#{Shellwords.escape(project)} --quiet"
+  Open3.capture3(cmd)
 end
 
 def add_gcp_secret_version(project, secret_name, secret_data)
@@ -477,11 +677,12 @@ ENV_NS = CONFIG['environment'] || 'dev'
 
 case ARGV[0]
 when "init"
-  
-  unless File.exist?(".git-privatize.list")
-    FileUtils.touch(".git-privatize.list")
-    success "Created .git-privatize.list"
+  FileUtils.mkdir_p(CACHE_DIR)
+  unless File.exist?(TRACKED_CACHE_FILE)
+    FileUtils.touch(TRACKED_CACHE_FILE)
+    success "Created #{TRACKED_CACHE_FILE}"
   end
+  update_gitignore([".cache/"])
   
   bucket_name = CONFIG['gcs_bucket'] || "gs://#{CONFIG['project_id']}-gprism"
   unless bucket_name.start_with?("gs://")
@@ -503,7 +704,7 @@ when "push"
   non_flags = ARGV[1..-1].reject { |arg| arg.start_with?("-") }
 
   if flags.include?("--all") || flags.include?("-a")
-    files = list_files
+    files = discover_files(CONFIG['project_id'], ENV_NS, update_cache: true)
   else
     files = non_flags
   end
@@ -524,7 +725,8 @@ when "push"
     content = File.read(file)
     enc_content = encrypt(content, pass)
     
-    if gcp_secret_exists?(CONFIG['project_id'], name)
+    secret_existed = gcp_secret_exists?(CONFIG['project_id'], name)
+    if secret_existed
       remote_enc_content = fetch_gcp_secret_version(CONFIG['project_id'], name)
       if remote_enc_content && !remote_enc_content.empty?
         if remote_enc_content.start_with?("GPRISM_GCS_URI=")
@@ -533,10 +735,14 @@ when "push"
         end
         remote_content = decrypt(remote_enc_content, pass)
         force_push = flags.include?("--force") || flags.include?("-f")
-        next unless force_push || compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
+        unless force_push || compare_and_prompt("push", file, name, content, remote_content, CONFIG['project_id'])
+          update_gitignore([file])
+          add_to_privatize_list(file, quiet: true)
+          next
+        end
       end
     else
-      create_gcp_secret(CONFIG['project_id'], name)
+      create_gcp_secret(CONFIG['project_id'], name, file)
     end
     
     # Handle large payloads via GCS offloading
@@ -561,8 +767,10 @@ when "push"
     end
     
     if add_gcp_secret_version(CONFIG['project_id'], name, enc_content)
+      ensure_gcp_secret_path_annotation(CONFIG['project_id'], name, file) if secret_existed
       success "Pushed #{file} to Secret Manager as #{name}"
       update_gitignore([file])
+      add_to_privatize_list(file, quiet: true)
     else
       error "Failed to push #{file}"
     end
@@ -579,7 +787,7 @@ when "pull"
   non_flags = ARGV[1..-1].reject { |arg| arg.start_with?("-") }
 
   if flags.include?("--all") || flags.include?("-a")
-    files = list_files
+    files = discover_files(CONFIG['project_id'], ENV_NS, update_cache: true)
   else
     files = non_flags
   end
@@ -606,6 +814,12 @@ when "pull"
     
     if enc_content.start_with?("GPRISM_GCS_URI=")
       gcs_uri = enc_content.sub("GPRISM_GCS_URI=", "").strip
+      if gcs_uri =~ %r{\Ags://[^/]+/#{Regexp.escape(ENV_NS)}/#{Regexp.escape(get_repo_slug)}/(.+)\.enc\z}
+        gcs_rel_path = $1
+        if generate_secret_name(gcs_rel_path, ENV_NS) == name && file != gcs_rel_path && !File.exist?(file)
+          file = gcs_rel_path
+        end
+      end
       info "Large payload detected. Downloading from GCS: #{gcs_uri}"
       enc_content = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
       if !$?.success? || enc_content.nil? || enc_content.empty?
@@ -617,7 +831,11 @@ when "pull"
     
     if File.exist?(file)
       local_content = File.read(file)
-      next unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
+      unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
+        update_gitignore([file])
+        add_to_privatize_list(file, quiet: true)
+        next
+      end
     end
     
     FileUtils.mkdir_p(File.dirname(file))
@@ -625,6 +843,8 @@ when "pull"
     File.write(file, dec_content)
     File.chmod(0400, file)
     success "Restored #{file} from GCP (read-only)"
+    update_gitignore([file])
+    add_to_privatize_list(file, quiet: true)
     if File.exist?("#{file}.readme")
       File.delete("#{file}.readme")
     end
@@ -681,15 +901,7 @@ when "add"
     end
   end
   
-  list_file = '.git-privatize.list'
-  lines = File.exist?(list_file) ? File.readlines(list_file).map(&:strip) : []
-  unless lines.include?(file)
-    File.open(list_file, "a") { |f| f.puts file }
-    success "Added #{file} to #{list_file}"
-  else
-    info "#{file} is already in #{list_file}"
-  end
-  
+  add_to_privatize_list(file, quiet: false)
   update_gitignore([file])
   info "Run `gprism push --all` to encrypt and upload."
 
@@ -766,9 +978,10 @@ when "decrypt"
   end
 
 when "status", "st"
-  files = list_files
-  if files.empty?
-    info "No files listed in .git-privatize.list"
+  files = discover_files(CONFIG['project_id'], ENV_NS, update_cache: true)
+  local_enc_files = Dir.glob("**/*.gprenc")
+  if files.empty? && local_enc_files.empty?
+    info "No tracked files found in #{TRACKED_CACHE_FILE} or Secret Manager"
     exit 0
   end
   puts "Gprism Status (Project: #{CONFIG['project_id']}, Env: #{ENV_NS})"
@@ -783,6 +996,7 @@ when "status", "st"
   
   pass = get_passphrase(ENV_NS) rescue nil
   diffs_to_show = []
+  missing_local_files = []
   tracked_files = []
   not_ignored_files = []
   
@@ -802,6 +1016,13 @@ when "status", "st"
       if payload.start_with?("GPRISM_GCS_URI=")
         remote_type = "🪣 GS"
         gcs_uri = payload.sub("GPRISM_GCS_URI=", "").strip
+        if gcs_uri =~ %r{\Ags://[^/]+/#{Regexp.escape(ENV_NS)}/#{Regexp.escape(get_repo_slug)}/(.+)\.enc\z}
+          gcs_rel_path = $1
+          if generate_secret_name(gcs_rel_path, ENV_NS) == name && file != gcs_rel_path && !File.exist?(file)
+            file = gcs_rel_path
+            max_file_len = [max_file_len, file.length].max
+          end
+        end
         if download_binaries
           payload = `gcloud storage cp #{Shellwords.escape(gcs_uri)} - 2>/dev/null`
         else
@@ -814,6 +1035,7 @@ when "status", "st"
     
     local_exists = File.exist?(file)
     readme_exists = File.exist?("#{file}.readme")
+    missing_local_files << file if remote_type && !local_exists
     
     # 2. Compute Sync state
     sync_state = nil
@@ -849,8 +1071,8 @@ when "status", "st"
     elsif remote_type && payload && pass
       remote_content = decrypt(payload, pass)
       
-      # Always download to .gprism/remote/
-      remote_path = File.join(".gprism/remote", file)
+      # Always download to .cache/gprism/remote/
+      remote_path = File.join(CACHE_DIR, "remote", file)
       FileUtils.mkdir_p(File.dirname(remote_path))
       File.write(remote_path, remote_content)
       
@@ -868,6 +1090,8 @@ when "status", "st"
       else
         sync_state = "#{RED}❌ Miss#{RESET}"
       end
+    elsif !local_exists && remote_type
+      sync_state = "#{RED}❌ Miss#{RESET}"
     elsif local_exists && !remote_type
       sync_state = "#{RED}❌ Miss#{RESET}"
     end
@@ -899,7 +1123,6 @@ when "status", "st"
     puts "💾 #{colorized_file}#{pad_file} -> #{name}#{pad_name} [ #{status.join(' | ')} ]"
   end
   
-  local_enc_files = Dir.glob("**/*.gprenc")
   local_enc_files.each do |enc_file|
     orig_file = enc_file.sub(/\.gprenc$/, '')
     
@@ -930,6 +1153,11 @@ when "status", "st"
     puts "#{CYAN}   To inspect details & MD5s: #{RESET}gprism show <filepath> (or gprism diff <filepath>)"
     puts "#{CYAN}   To push local changes    : #{RESET}gprism push -a"
     puts "#{CYAN}   To restore from remote   : #{RESET}gprism pull -a"
+  end
+
+  if missing_local_files.any?
+    puts "\n#{YELLOW}💡 Hint: #{missing_local_files.size} remote secret(s) are missing locally (#{missing_local_files.join(', ')}).#{RESET}"
+    puts "#{CYAN}   To pull all from remote  : #{RESET}gprism pull -a"
   end
   
   auto_fix = ARGV.include?("--git-ignore") || ARGV.include?("--fix")
@@ -983,7 +1211,8 @@ when "list", "ls"
   end
   
   puts "#{CYAN}Fetching secrets from GCP Project: #{CONFIG['project_id']}...#{RESET}"
-  stdout, stderr, status = Open3.capture3("gcloud secrets list --project=#{Shellwords.escape(CONFIG['project_id'])} --format=json")
+  filter_arg = (!show_all && repo_filter) ? " --filter=name:#{Shellwords.escape("#{ENV_NS}--#{repo_filter}--")}" : ""
+  stdout, stderr, status = Open3.capture3("gcloud secrets list --project=#{Shellwords.escape(CONFIG['project_id'])}#{filter_arg} --format=json")
   unless status.success?
     check_gcp_error!(CONFIG['project_id'], stderr, "listing secrets")
     warn "Failed to fetch secrets: #{stderr.strip}"
@@ -1036,23 +1265,10 @@ when "list", "ls"
     end
     
     # Try to extract friendly name
-    friendly_name = nil
-    if repo_filter
-      prefix = "#{ENV_NS}--#{repo_filter}--"
-      if secret_name.start_with?(prefix)
-        local_match = local_files.find { |f| generate_secret_name(f, ENV_NS) == secret_name }
-        if local_match
-          friendly_name = local_match
-        else
-          file_slug = secret_name[prefix.length..-1]
-          file_slug = ".#{file_slug[1..-1]}" if file_slug.start_with?("-")
-          friendly_name = file_slug
-        end
-      else
-        friendly_name = secret_name
-      end
+    if repo_filter && secret_name.start_with?("#{ENV_NS}--#{repo_filter}--")
+      friendly_name = resolve_filepath_for_secret(s, ENV_NS, repo_filter, local_files)
     else
-      friendly_name = secret_name
+      friendly_name = decode_filepath_annotation(s["annotations"]) || secret_name
     end
     matched_secrets << friendly_name
     
@@ -1244,14 +1460,14 @@ when "--ai-help"
     `gprism` is a CLI tool that encrypts local repository secrets using a symmetric key, then uploads them to GCP Secret Manager (for small text files) or GCS (for large/binary files).
     
     ## Commands
-    - `gprism init`: Creates `.env.template`, `.git-privatize.list`, and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
-    - `gprism add <filepath>`: Adds a file to `.git-privatize.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
+    - `gprism init`: Creates `.cache/gprism/tracked.list` and creates a GCS bucket (with versioning) named `gs://$PROJECT_ID-gprism`.
+    - `gprism add <filepath>`: Adds a file to `.cache/gprism/tracked.list`. Will intelligently halt if the file is > 50KB or binary AND the GCS bucket is not initialized, encouraging the user to run `gprism init`.
     - `gprism show <filepath>` (aliases: `inspect`, `diff`): Displays HERE vs THERE comparison including MD5 checksums, Secret Manager version counts, timestamps, and unified diffs when out of sync.
     - `gprism push [--all|-a] [file...]`: Encrypts and pushes files (either all tracked files or the specified files) to GCP. If encrypted payload > 60KB, pushes to GCS and puts a pointer in Secret Manager.
     - `gprism pull [--all|-a] [file...]`: Decrypts and pulls files from GCP, restoring plaintext files.
     - `gprism encrypt <files>`: Encrypts files offline, adds original to `.gitignore`, and automatically `git add`s the `.gprenc` file. Uses an auto-generated SM key. Use `--yes` to bypass warnings.
     - `gprism decrypt <files>`: Decrypts `.gprenc` files. (Mostly for troubleshooting, as `pull --all` does this automatically).
-    - `gprism status` (or `st`): Compares local `.git-privatize.list` against the remote Secret Manager to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.
+    - `gprism status` (or `st`): Queries GCP Secret Manager and local `.cache/gprism/tracked.list` to show synchronization status (`✅ Sync` or `⚠️ M`). Also detects and lists local `*.gprenc` files.
     - `gprism list` (or `ls`): Queries GCP Secret Manager and GCS directly to list all secrets for the current repository and environment. Can be filtered with `--all`.
     - `gprism --version`: Prints gprism version.
     

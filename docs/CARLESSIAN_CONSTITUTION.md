@@ -1,4 +1,4 @@
-# THE CARLESSIAN CONSTITUTION
+# THE CARLESSIAN CONSTITUTION (v1.1)
 
 1. **Deterministic Naming:** Secrets MUST strictly follow `<env>--<repo-slug>--<file-slug>`.
 2. **Unified Syncing:** `pull -a` and `push -a` MUST handle SM, GS, and GP seamlessly.
@@ -7,7 +7,7 @@
 5. **Security First:** `gprism add` or `encrypt` MUST automatically `.gitignore` plaintext files.
 6. **Automagical DX:** The CLI should be deterministic, single-command, and zero-friction.
 7. **Visual Simplicity:** Keep statuses to 1 emoji + 2 letters (e.g. 🔑 SM) for a clean UI.
-8. **Configuration Files:** Gprism strictly uses `~/.config/gprism/config.yaml` for global configs. Project-level files (`.git-privatize.list` for tracking, and `.env` for secrets) MUST reside in the **GIT ROOT**, not anywhere else.
+8. **Configuration Files & Tracking:** Gprism strictly uses `~/.config/gprism/config.yaml` for global configs (with optional `GPRISM_*` overrides in `GITROOT/.env`), while local tracking caches live in `GITROOT/.cache/gprism/` (with Secret Manager as the single source of truth). Tracked secret files (e.g. `.env`, `OTHER_DIR/.env`, `private/...`) may reside anywhere within the **GIT ROOT** boundaries.
 9. **Self-Healing Commands:** The CLI should empower users with auto-fix capabilities (e.g. `status --fix`) rather than just printing raw copy-paste commands, providing frictionless "one-click" error recovery.
 10. **Subdirectory Resilience:** Any git-related or fix commands executed by the CLI MUST run relative to the git root (e.g. `cd $(git rev-parse --show-toplevel)`), ensuring deterministic behavior regardless of the user's current directory.
 11. **Git Semantics:** Core commands like `push`, `pull`, and `status` MUST mimic Git's look, feel, and semantics. This means operating consistently from the repository space (not folder space), accepting familiar arguments, and providing intuitive CLI feedback.

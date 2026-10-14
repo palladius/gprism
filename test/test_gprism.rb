@@ -37,13 +37,19 @@ class TestGprism < Minitest::Test
     @secret_content = "super_secret_value_#{@test_id}"
     File.write(@secret_file, @secret_content)
     
-    # Create git-privatize.list
-    File.write(".git-privatize.list", "#{@secret_file}\n")
+    # Create .cache/gprism/tracked.list
+    FileUtils.mkdir_p(".cache/gprism")
+    File.write(".cache/gprism/tracked.list", "#{@secret_file}\n")
   end
 
   def teardown
     # Clean up GCP secrets
-    system("gcloud secrets delete #{@secret_name} --project=palladius-genai --quiet >/dev/null 2>&1")
+    system("gcloud secrets delete #{@secret_name} --project=palladius-genai --account=#{@identity} --quiet >/dev/null 2>&1")
+    if @extra_secrets
+      @extra_secrets.each do |sec|
+        system("gcloud secrets delete #{sec} --project=palladius-genai --account=#{@identity} --quiet >/dev/null 2>&1")
+      end
+    end
     
     # Clean up files
     Dir.chdir(@workdir)
@@ -113,22 +119,25 @@ class TestGprism < Minitest::Test
       bin_path = File.expand_path("../bin/gprism", __dir__)
       out = `#{bin_path} add sub_secret.txt 2>&1`.gsub(/\e\[\d+m/, '')
       
-      # It should NOT create .git-privatize.list or .gitignore in the subfolder
+      # It should NOT create .cache, .git-privatize.list or .gitignore in the subfolder
+      refute File.exist?(".cache/gprism/tracked.list"), "Should not create cache list in subfolder"
       refute File.exist?(".git-privatize.list"), "Should not create .git-privatize.list in subfolder"
       refute File.exist?(".gitignore"), "Should not create .gitignore in subfolder"
       refute File.exist?(".env.template"), "Should not create .env.template anywhere via add/st"
     end
 
-    # Check that it updated the ROOT .git-privatize.list with the relative path
-    assert File.exist?(".git-privatize.list"), "Root list should exist"
-    assert_includes File.read(".git-privatize.list"), file_path
-    assert_includes out, "SUCCESS: Added #{file_path} to .git-privatize.list"
+    # Check that it updated the ROOT .cache/gprism/tracked.list with the relative path and did NOT create .git-privatize.list
+    assert File.exist?(".cache/gprism/tracked.list"), "Root cache list should exist"
+    refute File.exist?(".git-privatize.list"), "Root .git-privatize.list should no longer be created"
+    assert_includes File.read(".cache/gprism/tracked.list"), file_path
+    assert_includes out, "SUCCESS: Added #{file_path} to .cache/gprism/tracked.list"
   end
 
   def test_status_binary
     binary_file = "my_binary.jpg"
     File.write(binary_file, "fake_binary_data" * 10000) # 160KB
-    File.open(".git-privatize.list", "a") { |f| f.puts(binary_file) }
+    File.open(".cache/gprism/tracked.list", "a") { |f| f.puts(binary_file) }
+    @extra_secrets = ["test--unknown-repo--my-binary-jpg"]
 
     # Push to GCS
     out = `#{@bin} push -f --all`.gsub(/\e\[\d+m/, '')
@@ -148,7 +157,7 @@ class TestGprism < Minitest::Test
   def test_version_flags
     ["--version", "-v", "version"].each do |flag|
       out = `#{@bin} #{flag}`.strip
-      assert_equal "gprism 0.3.6", out
+      assert_equal "gprism 0.3.7", out
       assert_equal 0, $?.exitstatus
     end
   end
@@ -177,5 +186,41 @@ class TestGprism < Minitest::Test
     assert_includes show_mod, "[ ⚠️ DOES NOT MATCH LOCAL ]"
     assert_includes show_mod, "Difference Details (TEXTUAL File Diff: HERE vs THERE):"
     assert_includes show_mod, "MODIFIED_VALUE_"
+  end
+
+  def test_remote_discovery_without_privatize_list
+    repo_slug = "palladius-test-repo-#{@test_id}"
+    system("git remote add origin https://github.com/palladius/test-repo-#{@test_id}.git >/dev/null 2>&1")
+
+    FileUtils.mkdir_p("private")
+    second_file = "private/other-computer-tricks.md"
+    second_content = "pushed_from_other_computer_#{@test_id}"
+    File.write(second_file, second_content)
+
+    first_sec = "test--#{repo_slug}--my-secret-file-#{@test_id}-txt"
+    second_sec = "test--#{repo_slug}--private-other-computer-tricks-md"
+    @extra_secrets = [first_sec, second_sec]
+
+    # Push first file via --all and second file directly (simulating another computer)
+    `#{@bin} push --all`
+    `#{@bin} push #{second_file}`
+
+    # Now simulate Computer B: remove second_file from disk AND remove local cache completely!
+    File.delete(second_file)
+    FileUtils.rm_rf(".cache")
+
+    # 1. Status should still discover BOTH secrets directly from Secret Manager!
+    st_out = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    assert_includes st_out, @secret_file
+    assert_includes st_out, second_file
+    assert_includes st_out, "❌ Miss | 🔑 SM | ❌ Local"
+
+    # 2. Pull -a should pull the missing second_file even without any prior cache!
+    FileUtils.rm_rf(".cache")
+    pull_out = `#{@bin} pull -a`.gsub(/\e\[\d+m/, '')
+    assert_includes pull_out, "SUCCESS: Restored #{second_file} from GCP (read-only)"
+    assert File.exist?(second_file), "Second file should be pulled to disk"
+    assert_equal second_content, File.read(second_file)
+    assert File.exist?(".cache/gprism/tracked.list"), "Cache should be populated in .cache/gprism/tracked.list"
   end
 end

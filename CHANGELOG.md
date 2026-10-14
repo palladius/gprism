@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-10-14
+### Added
+- 🔵 📜 **Carlessian Constitution v1.1 (Bye-bye `.git-privatize.list`!):** Moved local tracking cache out of the Git Root into `GITROOT/.cache/gprism/tracked.list` (and remote diffs into `GITROOT/.cache/gprism/remote/`), keeping legacy `.git-privatize.list` read-fallback & auto-migration for backward compatibility. Clarified Article 8 so `GPRISM_*` overrides live in `GITROOT/.env` while tracked secret files (e.g. `.env`, `OTHER_DIR/.env`, `private/...`) can reside anywhere within the Git Root boundaries.
+- 🔵 🔑 **Remote Secret Discovery:** `gprism status`, `gprism pull -a`, and `gprism push -a` now query GCP Secret Manager directly for all secrets matching `<env>--<repo-slug>--*`, so artifacts pushed from another machine are automatically discovered and pulled without needing a tracked list in git.
+- 🔵 🏷️ **Exact Filepath Annotations in Secret Manager:** `gprism push` (and `discover_files` backfill) now stores the base64url-encoded relative filepath in GCP Secret Manager annotations (`gprism-path-b64`), making remote secrets 100% self-describing.
+- 🔵 🧠 **Smart Legacy Slug Reconstruction:** Added intelligent filepath inference (matching `.env*`, `**/.env*`, `.gitignore` entries, local directories/files, `private/`, and file extensions) for existing secrets created before annotations.
+- 🔵 💡 Added a hint in `gprism status` when remote secrets exist in GCP but are missing on local disk.
+
+### Fixed
+- 🔵 🛠️ Fixed `gprism push <file>` and `gprism pull` so they also self-heal `.cache/gprism/tracked.list` and `.gitignore`.
+
 ## [0.3.6] - 2026-09-09
 ### Added
 - Added `--version`, `-v`, and `version` commands/flags to display current gprism version.
