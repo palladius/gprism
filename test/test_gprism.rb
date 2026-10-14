@@ -157,9 +157,39 @@ class TestGprism < Minitest::Test
   def test_version_flags
     ["--version", "-v", "version"].each do |flag|
       out = `#{@bin} #{flag}`.strip
-      assert_equal "gprism 0.3.7", out
+      assert_equal "gprism 0.3.8", out
       assert_equal 0, $?.exitstatus
     end
+  end
+
+  def test_untracked_env_in_status_and_auto_fix
+    # In setup, .cache/gprism/tracked.list has only @secret_file, so .env is untracked
+    status_out = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    assert_includes status_out, "⚠️ Untracked"
+    assert_includes status_out, "WARN: 1 secret file(s) exist but are NOT tracked in .cache/gprism/tracked.list!"
+    assert_includes status_out, ".env"
+    assert_includes status_out, "gprism status --fix"
+
+    # Now run status --fix
+    fix_out = `#{@bin} status --fix`.gsub(/\e\[\d+m/, '')
+    assert_includes fix_out, "Auto-fixing .cache/gprism/tracked.list"
+    assert_includes File.read(".cache/gprism/tracked.list"), ".env"
+
+    # Now run status again: .env is no longer untracked
+    status_out_after = `#{@bin} status`.gsub(/\e\[\d+m/, '')
+    refute_includes status_out_after, "⚠️ Untracked"
+    refute_includes status_out_after, "NOT tracked in .cache/gprism/tracked.list"
+  end
+
+  def test_init_auto_seeds_env
+    FileUtils.rm_rf(".cache")
+    File.delete(".git-privatize.list") if File.exist?(".git-privatize.list")
+    assert File.exist?(".env")
+
+    out = `#{@bin} init`.gsub(/\e\[\d+m/, '')
+    assert File.exist?(".cache/gprism/tracked.list")
+    assert_includes File.read(".cache/gprism/tracked.list"), ".env"
+    assert_includes out, "Added .env to .cache/gprism/tracked.list"
   end
 
   def test_show_and_modified_status

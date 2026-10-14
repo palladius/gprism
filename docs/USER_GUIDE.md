@@ -4,7 +4,7 @@ Gprism is a magical CLI tool to sync environment secrets and encrypted files sea
 
 ## Configuration
 
-Gprism manages the `.git-privatize.list` config file automatically when you run `gprism add`. The architecture stores global project metadata in `~/.config/gprism/config.yaml` and repository-level mappings in `[repo]/.git-privatize.list`.
+Gprism uses GCP Secret Manager as its single source of truth and caches local tracking state automatically in `[repo]/.cache/gprism/tracked.list` (with backward-compatible read support for legacy `.git-privatize.list` files). Global project metadata lives in `~/.config/gprism/config.yaml` (with optional `GPRISM_*` overrides in `[repo]/.env`).
 
 ## Core Commands
 
@@ -28,16 +28,30 @@ Displays a visual status of your secrets with emoji indicators:
 - `🔐 GP`: Managed via Offline Encryption (`.gprenc`)
 - `💻 Local` / `❌ Local`: Tells you if the file exists on your disk.
 - `☁️ Remote` / `❌ Remote`: Tells you if the secret is backed up to GCP.
-- **Auto-Fixing**: Run `gprism status --git-ignore` (or `--fix`) to automatically add untracked secrets to `.gitignore` and remove erroneously tracked secrets from the git cache (`git rm --cached`).
+- `✅ Sync`: Content hash matches remote version exactly.
+- `⚠️ M`: Content differs from remote version (modified locally). Shows unified diff automatically.
+- `⚠️ Untracked`: Secret file (like `.env`) exists locally or remotely but is NOT yet tracked in `.cache/gprism/tracked.list`.
+- **Auto-Fixing**: Run `gprism status --fix` (or `--git-ignore`) to automatically:
+  1. Add untracked secret files (e.g. `.env`) to `.cache/gprism/tracked.list` and `.gitignore`.
+  2. Add un-ignored secret files to `.gitignore`.
+  3. Untrack erroneously tracked secrets from Git index (`git rm --cached`).
 
-### 4. `gprism push [file]`
-- Pushes local files (e.g. `.env`) into GCP.
-- Supports the `--force` flag to force re-uploading your local file to GCP, even if the content hash hasn't changed (useful to fix broken remote metadata).
+### 4. `gprism show <filepath>` (aliases: `inspect`, `diff`, `describe`)
+Displays an in-depth HERE (Local) vs THERE (Remote) comparison:
+- Local file size, modification timestamp, and MD5 hash.
+- Secret Manager versions count, remote timestamp, and remote MD5 hash.
+- Full textual unified diff with colored line changes (`+` local, `-` remote).
 
-### 5. `gprism pull -a`
+### 5. `gprism push [file...]` (or `push -a`)
+- Pushes local files (e.g. `.env`) into GCP. If no specific files are given, use `-a` / `--all` to push all tracked secrets.
+- Pushed files are automatically added to `.cache/gprism/tracked.list` and `.gitignore`.
+- Warns if untracked secret files (`.env`) are detected on disk.
+- Supports `--force` (`-f`) flag to re-upload local files even if hashes match.
+
+### 6. `gprism pull [file...]` (or `pull -a`)
 The ultimate unified sync command.
 When you clone a repository on a new machine, simply run `gprism pull -a`:
-1. It downloads all secrets defined in `.git-privatize.list` from Secret Manager and GCS.
+1. It queries GCP Secret Manager (and local `.cache/gprism/tracked.list`) to discover and download all secrets for the repository from Secret Manager and GCS.
 2. It auto-discovers any `.gprenc` files in your repository.
 3. It fetches the repository's encryption key from GCP and seamlessly decrypts them into their plaintext equivalents.
 
@@ -49,4 +63,7 @@ When you clone a repository on a new machine, simply run `gprism pull -a`:
 * ❌ **Local**: File is missing locally (Run `pull -a` to fix!)
 * ☁️ **Remote**: Secret is backed up on GCP
 * ❌ **Remote**: Secret is missing from GCP (Run `push` to fix!)
+* ✅ **Sync**: Local matches remote exactly
+* ⚠️ **M**: Locally modified vs remote version
+* ⚠️ **Untracked**: Secret file exists but not registered in `.cache/gprism/tracked.list` (Run `st --fix`!)
 * 📝 **Readme**: Documented in `README.md`
