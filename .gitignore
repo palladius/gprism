@@ -5,6 +5,7 @@
 *.tmp
 *.enc
 *.swp
+*.gem
 
 # Ignore test repositories and settings
 /test_repo/
