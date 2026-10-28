@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-10-28
+### Added
+- 💎 **RubyGem Packaging & Programmatic API Scaffold:**
+  - Added `gprism.gemspec` and `Gemfile` for zero-dependency gem packaging (`gem install gprism`, fixes #11).
+  - Scaffolded `lib/gprism.rb` and `lib/gprism/version.rb` defining the `Gprism` module (`Gprism.init`, `Gprism.status`, `Gprism.filter_secret_files`).
+  - Updated `bin/gprism` to load `lib/gprism` dynamically while maintaining backward-compatible standalone CLI execution.
+  - Added unit test suite `test/test_gem.rb` and updated `Justfile` (`just test`, `just build`, `just install`).
+
 ## [0.3.9] - 2026-10-27
 ### Added
 - Added comprehensive unit tests for `gprism --help`, `help`, and `gprism --ai-help` flags (closes #6).

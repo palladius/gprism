@@ -52,8 +52,14 @@ YELLOW = "\e[33m"
 BOLD   = "\e[1m"
 RESET  = "\e[0m"
 
+begin
+  require_relative '../lib/gprism'
+rescue LoadError
+  # Fallback if lib is not in parent directory
+end
+
 VERSION_FILE = File.expand_path("../VERSION", __dir__)
-GPRISM_VERSION = File.exist?(VERSION_FILE) ? File.read(VERSION_FILE).strip : "0.3.8"
+GPRISM_VERSION = defined?(Gprism::VERSION) ? Gprism::VERSION : (File.exist?(VERSION_FILE) ? File.read(VERSION_FILE).strip : "0.3.9")
 
 if ARGV[0] == "--version" || ARGV[0] == "version" || ((ARGV[0] == "-v" || ARGV[0] == "-V") && ARGV.size == 1)
   puts "gprism #{GPRISM_VERSION}"
