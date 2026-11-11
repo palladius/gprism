@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-11-11
+### Added
+- `gprism pull` without file arguments now defaults to pulling all discovered/tracked files (equivalent to `gprism pull --all`).
+- Added `--force` / `-f` / `-y` support to `gprism pull`, and automatic conflict resolution in non-interactive mode when the remote Secret Manager version is strictly newer than the local file.
+- `gprism pull` now automatically invokes `bin/oauth_keys apply` when present in the repository (e.g. GIC) to keep local OAuth client secrets and `credentials.enc` in sync.
+
 ## [0.3.9] - 2026-10-27
 ### Added
 - Added comprehensive unit tests for `gprism --help`, `help`, and `gprism --ai-help` flags (closes #6).

@@ -617,8 +617,11 @@ def compare_and_prompt(action, file, name, local_content, remote_content, projec
     print "Are you sure you want to #{action} and overwrite? [y/N] "
     ans = STDIN.gets.chomp.downcase
     return ans == 'y'
+  elsif action == "pull" && remote_time > local_time
+    info "Non-interactive mode: remote secret #{name} is newer than local #{file}, auto-pulling."
+    return true
   else
-    warn "Non-interactive mode, skipping #{action} due to conflict."
+    warn "Non-interactive mode, skipping #{action} due to conflict (use --force to overwrite)."
     return false
   end
 end
@@ -800,7 +803,7 @@ when "pull"
   flags = ARGV[1..-1].select { |arg| arg.start_with?("-") }
   non_flags = ARGV[1..-1].reject { |arg| arg.start_with?("-") }
 
-  if flags.include?("--all") || flags.include?("-a")
+  if flags.include?("--all") || flags.include?("-a") || non_flags.empty?
     files = discover_files(CONFIG['project_id'], ENV_NS, update_cache: true)
   else
     files = non_flags
@@ -845,7 +848,14 @@ when "pull"
     
     if File.exist?(file)
       local_content = File.read(file)
-      unless compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
+      force_pull = flags.include?("--force") || flags.include?("-f") || flags.include?("-y")
+      if force_pull && Digest::MD5.hexdigest(local_content) == Digest::MD5.hexdigest(dec_content)
+        info "#{file} is identical to remote secret #{name}. Skipping pull."
+        update_gitignore([file])
+        add_to_privatize_list(file, quiet: true)
+        next
+      end
+      unless force_pull || compare_and_prompt("pull", file, name, local_content, dec_content, CONFIG['project_id'])
         update_gitignore([file])
         add_to_privatize_list(file, quiet: true)
         next
@@ -864,7 +874,7 @@ when "pull"
     end
   end
   
-  if flags.include?("--all") || flags.include?("-a")
+  if flags.include?("--all") || flags.include?("-a") || non_flags.empty?
     local_enc_files = Dir.glob("**/*.gprenc")
     if local_enc_files.any?
       info "Found #{local_enc_files.size} local .gprenc files. Decrypting..."
@@ -880,6 +890,11 @@ when "pull"
           warn "Failed to decrypt #{enc_file}: #{e.message}"
         end
       end
+    end
+
+    if File.executable?(File.join(Dir.pwd, "bin/oauth_keys")) && File.exist?(File.join(Dir.pwd, "etc/oauth_keys.yaml"))
+      info "Applying OAuth client secrets from etc/oauth_keys.yaml to local targets..."
+      system(File.join(Dir.pwd, "bin/oauth_keys"), "apply")
     end
   end
 
